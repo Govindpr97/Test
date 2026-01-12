@@ -1,0 +1,175 @@
+Hi dhanraj please find the formula for the added five columns in the sheet:
+
+
+
+1.  `signed_decayed` -----------------------
+
+
+
+  Formula
+
+
+
+df['forecast_decay_factor'] = np.exp(-0.15 * (df['remaining_months'] - 1))
+df['signed_decayed'] = df['committed_signed'] * df['forecast_decay_factor']
+
+
+
+Deals that are signed but far in the future are:
+
+
+
+* more likely to be delayed
+* more likely to be renegotiated
+* less reliable for near-term forecasts
+
+
+
+2.`revenue_macd` --------------------------------
+
+
+
+""short-term revenue trend − long-term revenue trend""
+formula:
+df['revenue_macd'] = df['actual_revenue'].shift(1).ewm(span=3, adjust=False).mean() - df['actual_revenue'].shift(1).ewm(span=6, adjust=False).mean()
+
+
+
+
+
+  Business meaning
+
+
+
+This shows whether  revenue momentum is accelerating or slowing .
+
+
+
+  Why it matters
+
+
+
+* Positive → growth speeding up
+* Negative → growth slowing down
+* Early warning before totals change
+
+
+
+  Business interpretation: Is our revenue trend improving or weakening right now
+
+
+
+3. log_signed_monthly ------------------------------
+
+
+
+  Formula
+
+log(1 + signed_monthly_run_rate)
+ 
+
+
+df['signed_monthly_run_rate'] = df['committed_signed'] / df['remaining_months']
+df['log_signed_monthly'] = np.log1p(df['signed_monthly_run_rate'])
+
+
+
+  Business meaning
+
+
+
+This compresses extreme values so  big deals don’t dominate the model .
+
+
+
+  Why it matters
+
+
+
+* Revenue is skewed (a few very large deals)
+* Log scaling makes patterns more stable
+* Helps model general behavior, not outliers
+
+
+
+
+
+4. pipeline_forecast_volatility` ----------------------------------
+
+
+
+  Formula
+
+
+
+```python
+3-month rolling std of pipeline % change
+```
+df['pipeline_forecast_volatility'] = df['wtd_pipeline'].pct_change().rolling(3, min_periods=1).std()
+
+
+
+
+
+  Business meaning
+
+
+
+This measures  how unstable or volatile the pipeline is .
+
+
+
+  Why it matters
+
+
+
+* Highly volatile pipeline = unreliable forecast
+* Stable pipeline = higher confidence
+
+
+
+  Business interpretation: How much is our pipeline jumping around month to month.
+
+
+
+5.  unsigned_monthly_run_rate  ------------------------------------------
+
+
+
+  Formula
+
+
+
+```python
+committed_signed / remaining_months
+```
+
+
+
+    df['unsigned_monthly_run_rate'] = df['committed_unsigned'] / df['remaining_months']
+
+
+
+
+
+  Business meaning
+
+
+
+This is the  monthly revenue pace implied by unsigned deals .
+
+
+
+  Why it matters
+
+
+
+* Shows execution pressure
+* Highlights unrealistic targets late in the year
+* Core anchor for forecasting
+
+
+
+  Business interpretation: At what monthly pace are unsigned deals contributing to revenue.
+ 
+
