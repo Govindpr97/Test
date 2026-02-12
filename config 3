@@ -1,1 +1,2152 @@
 ## testing the new code here so it will not lost
+########################################
+
+##feature importance
+
+
+# =============================================================================
+# Feature Importance Extraction
+# =============================================================================
+
+class FeatureImportanceExtractor:
+    """Extracts feature importance from trained models (from reference file)."""
+    
+    def __init__(self, model: Any, feature_names: List[str]):
+        """
+        Initialize with model and feature names.
+        
+        Args:
+            model: Trained ML model
+            feature_names: List of feature names
+        """
+        self.model = model
+        self.feature_names = feature_names
+    
+    def get_feature_importance(self) -> pd.DataFrame:
+        """
+        Extract feature importance from the model.
+        
+        Returns:
+            DataFrame with feature names and importance scores
+        """
+        importance_values = self._extract_importance()
+        
+        if importance_values is None:
+            logger.warning("Could not extract feature importance from model")
+            return pd.DataFrame()
+        
+        # Create DataFrame
+        df = pd.DataFrame({
+            'feature': self.feature_names[:len(importance_values)],
+            'importance': importance_values
+        })
+        
+        # Sort by importance and add rank
+        df = df.sort_values('importance', ascending=False).reset_index(drop=True)
+        df['rank'] = range(1, len(df) + 1)
+        
+        return df
+    
+    def _extract_importance(self) -> Optional[np.ndarray]:
+        """Extract importance values based on model type."""
+        model = self.model
+        
+        # Tree-based models (RF, GBR, XGBoost, LightGBM, CatBoost)
+        if hasattr(model, 'feature_importances_'):
+            return model.feature_importances_
+        
+        # Linear models (coefficients)
+        if hasattr(model, 'coef_'):
+            return np.abs(model.coef_).flatten()
+        
+        # Try to get from nested estimator
+        if hasattr(model, 'estimator_') and hasattr(model.estimator_, 'feature_importances_'):
+            return model.estimator_.feature_importances_
+        
+        return None
+    
+    def get_top_features(self, n: int = 10) -> List[Tuple[str, float]]:
+        """Get top N most important features."""
+        importance_df = self.get_feature_importance()
+        
+        if importance_df.empty:
+            return []
+        
+        top = importance_df.head(n)
+        return list(zip(top['feature'], top['importance']))
+    
+    def importance_summary(self) -> Dict[str, Any]:
+        """Generate a summary of feature importance."""
+        importance_df = self.get_feature_importance()
+        
+        if importance_df.empty:
+            return {"error": "Could not extract feature importance"}
+        
+        return {
+            "total_features": len(importance_df),
+            "top_10_features": self.get_top_features(10),
+            "importance_concentration": {
+                "top_5_pct": importance_df.head(5)['importance'].sum() / importance_df['importance'].sum() * 100,
+                "top_10_pct": importance_df.head(10)['importance'].sum() / importance_df['importance'].sum() * 100,
+            },
+            "full_importance_table": importance_df.to_dict('records')
+        }
+
+
+#############################################################################
+
+## 
+# =============================================================================
+# SHAP Analysis Module
+# =============================================================================
+
+class SHAPAnalyzer:
+    """Performs SHAP (SHapley Additive exPlanations) analysis."""
+    
+    def __init__(
+        self, 
+        model: Any, 
+        feature_names: List[str],
+        config: InterpretabilityConfig
+    ):
+        self.model = model
+        self.feature_names = feature_names
+        self.config = config
+        self._explainer = None
+        self._shap_values = None
+        self._background_data = None
+    
+    def _create_explainer(self, X_background: np.ndarray):
+        """Create appropriate SHAP explainer based on model type."""
+        try:
+            import shap
+        except ImportError:
+            raise ImportError(
+                "shap package not installed. Install with: pip install shap"
+            )
+        
+        model_name = type(self.model).__name__
+        explainer_type = self.config.shap_explainer_type
+        
+        # Sample background data if too large
+        if len(X_background) > self.config.shap_max_samples:
+            indices = np.random.choice(
+                len(X_background), 
+                self.config.shap_max_samples, 
+                replace=False
+            )
+            X_background = X_background[indices]
+        
+        self._background_data = X_background
+        
+        logger.info(f"Creating SHAP explainer for {model_name}")
+        
+        # Auto-select explainer type
+        if explainer_type == "auto":
+            # Tree-based models
+            if model_name in ['RandomForestRegressor', 'GradientBoostingRegressor', 
+                             'XGBRegressor', 'LGBMRegressor', 'CatBoostRegressor',
+                             'ExtraTreesRegressor', 'DecisionTreeRegressor']:
+                explainer_type = "tree"
+            # Linear models
+            elif model_name in ['LinearRegression', 'Ridge', 'Lasso', 
+                               'ElasticNet', 'BayesianRidge', 'HuberRegressor']:
+                explainer_type = "linear"
+            else:
+                explainer_type = "kernel"
+        
+        # Create explainer
+        if explainer_type == "tree":
+            self._explainer = shap.TreeExplainer(self.model)
+        elif explainer_type == "linear":
+            self._explainer = shap.LinearExplainer(self.model, X_background, feature_perturbation="correlation_dependent")
+        else:
+            # Kernel explainer as fallback (slower but universal)
+            self._explainer = shap.KernelExplainer(
+                self.model.predict, 
+                shap.sample(X_background, min(100, len(X_background)))
+            )
+        
+        return self._explainer
+    
+    def compute_shap_values(
+        self, 
+        X_train: np.ndarray, 
+        X_explain: np.ndarray
+    ) -> np.ndarray:
+        """
+        Compute SHAP values for explanation data.
+        
+        Args:
+            X_train: Training data for background
+            X_explain: Data to explain
+            
+        Returns:
+            SHAP values array
+        """
+        if self._explainer is None:
+            self._create_explainer(X_train)
+        
+        logger.info(f"Computing SHAP values for {len(X_explain)} samples")
+        
+        # Compute SHAP values
+        self._shap_values = self._explainer.shap_values(X_explain)
+        
+        # Handle different SHAP value formats
+        if isinstance(self._shap_values, list):
+            self._shap_values = self._shap_values[0]
+        
+        return self._shap_values
+    
+    def get_global_importance(self) -> pd.DataFrame:
+        """Get global feature importance from SHAP values."""
+        if self._shap_values is None:
+            raise ValueError("SHAP values not computed. Call compute_shap_values first.")
+        
+        # Mean absolute SHAP values (magnitude)
+        mean_abs_shap = np.abs(self._shap_values).mean(axis=0)
+        
+        # Mean SHAP values (direction)
+        mean_shap = self._shap_values.mean(axis=0)
+        
+        # Standard deviation (variability)
+        std_shap = self._shap_values.std(axis=0)
+        
+        df = pd.DataFrame({
+            'feature': self.feature_names[:len(mean_abs_shap)],
+            'shap_importance': mean_abs_shap,
+            'mean_shap_value': mean_shap,  # NEW: directional info
+            'std_shap_value': std_shap,     # NEW: variability
+            'direction': ['Positive' if x > 0 else 'Negative' for x in mean_shap],  # NEW
+            'consistency': mean_abs_shap / (std_shap + 1e-10)  # NEW: how consistent the impact is
+        })
+        
+        return df.sort_values('shap_importance', ascending=False).reset_index(drop=True)
+    
+    def generate_summary(self) -> Dict[str, Any]:
+        """Generate comprehensive SHAP analysis summary."""
+        global_importance = self.get_global_importance()
+        
+        # Calculate additional metrics
+        top_n = min(self.config.top_n_features, len(global_importance))
+        top_features = global_importance.head(top_n)
+        
+        # Calculate cumulative importance
+        cumulative_importance = (
+            top_features['shap_importance'].sum() / 
+            global_importance['shap_importance'].sum() * 100
+        )
+        
+        return {
+            "method": "SHAP",
+            "samples_analyzed": len(self._shap_values) if self._shap_values is not None else 0,
+            "total_features": len(global_importance),
+            
+            # Top features with directional info
+            "top_features": top_features.to_dict('records'),
+            
+            # Feature importance distribution
+            "feature_importance_distribution": {
+                "mean": float(global_importance['shap_importance'].mean()),
+                "std": float(global_importance['shap_importance'].std()),
+                "max": float(global_importance['shap_importance'].max()),
+                "min": float(global_importance['shap_importance'].min()),
+                "median": float(global_importance['shap_importance'].median()),
+                "top_n_cumulative": float(cumulative_importance),  # NEW
+            },
+            
+            # Directional analysis (NEW)
+            "directional_summary": {
+                "positive_impact_features": int((global_importance['mean_shap_value'] > 0).sum()),
+                "negative_impact_features": int((global_importance['mean_shap_value'] < 0).sum()),
+                "strongest_positive": global_importance[global_importance['mean_shap_value'] > 0].head(3)['feature'].tolist() if (global_importance['mean_shap_value'] > 0).any() else [],
+                "strongest_negative": global_importance[global_importance['mean_shap_value'] < 0].head(3)['feature'].tolist() if (global_importance['mean_shap_value'] < 0).any() else [],
+            },
+            
+            # Concentration metrics (NEW)
+            "concentration_metrics": self._calculate_concentration_metrics(global_importance),
+            
+            # Interpretation
+            "interpretation": self._generate_interpretation(global_importance)
+        }
+
+
+    def _calculate_concentration_metrics(self, importance_df: pd.DataFrame) -> Dict[str, Any]:
+        """Calculate feature importance concentration metrics."""
+        n_features = len(importance_df)
+        total_importance = importance_df['shap_importance'].sum()
+        
+        metrics = {}
+        
+        # Top K percentages
+        for k in [1, 3, 5, 10]:
+            if k <= n_features:
+                top_k_pct = (
+                    importance_df.head(k)['shap_importance'].sum() / 
+                    total_importance * 100
+                )
+                metrics[f'top_{k}_percentage'] = float(top_k_pct)
+        
+        # Gini coefficient (0 = perfect equality, 1 = perfect inequality)
+        sorted_importance = np.sort(importance_df['shap_importance'].values)
+        n = len(sorted_importance)
+        index = np.arange(1, n + 1)
+        gini = (2 * np.sum(index * sorted_importance)) / (n * np.sum(sorted_importance)) - (n + 1) / n
+        metrics['gini_coefficient'] = float(gini)
+        
+        # Effective number of features (entropy-based)
+        normalized = importance_df['shap_importance'] / total_importance
+        entropy = -np.sum(normalized * np.log(normalized + 1e-10))
+        effective_features = np.exp(entropy)
+        metrics['effective_num_features'] = float(effective_features)
+        
+        return metrics
+    
+    def _generate_interpretation(self, importance_df: pd.DataFrame) -> str:
+        """Generate human-readable interpretation."""
+        n_features = len(importance_df)
+        
+        if n_features == 0:
+            return "No features available for interpretation."
+        
+        # Top features
+        top_n = min(3, n_features)
+        top = importance_df.head(top_n)
+        features = top['feature'].tolist()
+        
+        # Build interpretation
+        interpretation = f"The top {top_n} most influential features are: {', '.join(features)}. "
+        
+        # Add directional insights for top features
+        if 'mean_shap_value' in top.columns:
+            for idx, row in top.iterrows():
+                direction = "increases" if row['mean_shap_value'] > 0 else "decreases"
+                interpretation += f"{row['feature']} typically {direction} predictions. "
+        
+        # Concentration analysis with context
+        top_k = min(5, n_features)
+        top_k_pct = (
+            importance_df.head(top_k)['shap_importance'].sum() / 
+            importance_df['shap_importance'].sum() * 100
+        )
+        
+        # Expected percentage if uniform distribution
+        expected_pct = (top_k / n_features) * 100
+        concentration_ratio = top_k_pct / expected_pct if expected_pct > 0 else 0
+        
+        # Context-aware interpretation
+        if n_features <= 5:
+            interpretation += f"With only {n_features} features, all contribute to predictions. "
+        elif concentration_ratio > 3.0:
+            interpretation += (
+                f"High concentration detected: top {top_k} features account for {top_k_pct:.1f}% "
+                f"of total importance (expected {expected_pct:.1f}% if uniform). "
+                f"Model relies heavily on a few key predictors, which may indicate strong signal "
+                f"or potential oversimplification. "
+            )
+        elif concentration_ratio > 2.0:
+            interpretation += (
+                f"Moderate concentration: top {top_k} features account for {top_k_pct:.1f}% "
+                f"of importance. Model has clear priorities but uses multiple predictors. "
+            )
+        elif concentration_ratio > 1.5:
+            interpretation += (
+                f"Balanced importance: top {top_k} features account for {top_k_pct:.1f}% "
+                f"of importance, suggesting distributed decision-making. "
+            )
+        else:
+            interpretation += (
+                f"Highly distributed importance: top {top_k} features only account for {top_k_pct:.1f}% "
+                f"of importance. Model uses many features, which may indicate complexity or noise. "
+            )
+        
+        # Add statistical insights
+        importance_cv = (
+            importance_df['shap_importance'].std() / 
+            importance_df['shap_importance'].mean()
+        )
+        
+        if importance_cv > 1.5:
+            interpretation += "High variability in feature importance suggests some features are much more critical than others. "
+        elif importance_cv < 0.5:
+            interpretation += "Low variability in feature importance suggests features contribute relatively evenly. "
+        
+        # Actionable insights
+        if concentration_ratio > 2.5:
+            interpretation += (
+                "Recommendation: Monitor top features closely for data quality and drift. "
+                "Consider feature engineering to reduce dependency on few features. "
+            )
+        elif concentration_ratio < 1.2 and n_features > 20:
+            interpretation += (
+                "Recommendation: Consider feature selection to reduce model complexity. "
+                "Many features may not be adding significant value. "
+            )
+        
+        return interpretation
+
+
+###################################
+
+
+# =============================================================================
+# LIME Analysis Module
+# =============================================================================
+
+class LIMEAnalyzer:
+    """Performs LIME (Local Interpretable Model-agnostic Explanations) analysis."""
+    
+    def __init__(
+        self, 
+        model: Any, 
+        feature_names: List[str],
+        config: InterpretabilityConfig
+    ):
+        self.model = model
+        self.feature_names = feature_names
+        self.config = config
+        self._explainer = None
+        self._explanations = []
+    
+    def _create_explainer(self, X_train: np.ndarray, mode: str = 'auto'):
+        """Create LIME explainer."""
+        try:
+            from lime import lime_tabular
+        except ImportError:
+            raise ImportError("lime package not installed. Install with: pip install lime")
+        
+        # Auto-detect mode
+        if mode == 'auto':
+            # Check if model has predict_proba (classification)
+            if hasattr(self.model, 'predict_proba'):
+                mode = 'classification'
+                logger.info("✓ Detected classification model")
+            else:
+                mode = 'regression'
+                logger.info("✓ Detected regression model")
+        
+        # Check for categorical features
+        categorical_features = self._detect_categorical_features(X_train)
+        
+        self._explainer = lime_tabular.LimeTabularExplainer(
+            training_data=X_train,
+            feature_names=self.feature_names,
+            mode=mode,
+            categorical_features=categorical_features,  # NEW
+            kernel_width=self.config.lime_kernel_width if hasattr(self.config, 'lime_kernel_width') else None,  # NEW
+            verbose=False,
+            random_state=42  # NEW: Reproducibility
+        )
+        
+        self._mode = mode
+        return self._explainer
+
+
+    def _detect_categorical_features(self, X_train: np.ndarray) -> List[int]:
+        """Detect categorical features (low unique values)."""
+        categorical_indices = []
+        
+        for i in range(X_train.shape[1]):
+            unique_values = np.unique(X_train[:, i])
+            # If <= 10 unique values, likely categorical
+            if len(unique_values) <= 10:
+                categorical_indices.append(i)
+        
+        if categorical_indices:
+            logger.info(f"Detected {len(categorical_indices)} categorical features")
+        
+        return categorical_indices
+    
+    def _calculate_fidelity_metrics(self) -> Dict[str, Any]:
+        """Calculate comprehensive model fidelity metrics."""
+        scores = [e.get('score', 0) for e in self._explanations if e.get('score') is not None]
+        
+        if not scores:
+            return {
+                "mean_r2": None,
+                "median_r2": None,
+                "min_r2": None,
+                "quality_assessment": "No fidelity scores available"
+            }
+        
+        mean_score = np.mean(scores)
+        median_score = np.median(scores)
+        min_score = np.min(scores)
+        std_score = np.std(scores)
+        
+        # Quality assessment
+        if mean_score > 0.8:
+            quality = "Excellent - LIME's linear models fit well"
+        elif mean_score > 0.6:
+            quality = "Good - Reasonable local approximation"
+        elif mean_score > 0.4:
+            quality = "Fair - Some instances poorly approximated"
+        else:
+            quality = "Poor - LIME may not be suitable for this model"
+        
+        # Check for low-fidelity instances
+        low_fidelity_count = sum(1 for s in scores if s < 0.5)
+        low_fidelity_pct = (low_fidelity_count / len(scores)) * 100
+        
+        return {
+            "mean_r2": float(mean_score),
+            "median_r2": float(median_score),
+            "min_r2": float(min_score),
+            "std_r2": float(std_score),
+            "low_fidelity_instances": low_fidelity_count,
+            "low_fidelity_percentage": float(low_fidelity_pct),
+            "quality_assessment": quality,
+            "interpretation": self._interpret_fidelity(mean_score, low_fidelity_pct)
+        }
+
+
+    def _interpret_fidelity(self, mean_score: float, low_fidelity_pct: float) -> str:
+        """Interpret fidelity scores."""
+        interpretation = f"LIME's linear approximations achieve R² = {mean_score:.3f} on average. "
+        
+        if mean_score < 0.5:
+            interpretation += "⚠️ Low fidelity suggests the model has complex non-linear behavior that LIME struggles to approximate locally. Consider using smaller kernel_width or more samples."
+        
+        if low_fidelity_pct > 20:
+            interpretation += f" {low_fidelity_pct:.1f}% of instances have poor local fit (R² < 0.5)."
+        
+        return interpretation
+    
+    def _analyze_sample_diversity(self, X_explain: np.ndarray, num_samples: int) -> Dict[str, Any]:
+        """Check if explained instances are diverse."""
+        from sklearn.metrics.pairwise import euclidean_distances
+        
+        # Get samples we're explaining
+        samples = X_explain[:num_samples]
+        
+        # Calculate pairwise distances
+        distances = euclidean_distances(samples)
+        
+        # Remove diagonal (distance to self)
+        np.fill_diagonal(distances, np.nan)
+        
+        mean_distance = np.nanmean(distances)
+        min_distance = np.nanmin(distances)
+        
+        # Compare to overall dataset spread
+        all_distances = euclidean_distances(X_explain[:min(1000, len(X_explain))])
+        np.fill_diagonal(all_distances, np.nan)
+        dataset_mean_distance = np.nanmean(all_distances)
+        
+        diversity_ratio = mean_distance / dataset_mean_distance
+        
+        if diversity_ratio > 0.8:
+            assessment = "Excellent - Samples cover diverse regions of feature space"
+        elif diversity_ratio > 0.5:
+            assessment = "Good - Reasonable sample diversity"
+        else:
+            assessment = "Poor - Samples are clustered, may not represent full model behavior"
+        
+        return {
+            "mean_pairwise_distance": float(mean_distance),
+            "diversity_ratio": float(diversity_ratio),
+            "assessment": assessment
+        }
+
+    def explain_instances(
+        self, 
+        X_train: np.ndarray,
+        X_explain: np.ndarray,
+        num_samples: Optional[int] = None
+    ) -> List[Dict[str, Any]]:
+        """
+        Generate LIME explanations for multiple instances.
+        
+        Args:
+            X_train: Training data
+            X_explain: Instances to explain
+            num_samples: Number of instances to explain (default: all)
+            
+        Returns:
+            List of explanation dictionaries
+        """
+        if self._explainer is None:
+            self._create_explainer(X_train)
+        
+        if num_samples is None or num_samples > len(X_explain):
+            num_samples = min(len(X_explain), 50)  # Limit for performance
+        
+        logger.info(f"Generating LIME explanations for {num_samples} instances")
+        
+        self._explanations = []
+        
+        for i in range(num_samples):
+            try:
+                exp = self._explainer.explain_instance(
+                    X_explain[i],
+                    self.model.predict,
+                    num_features=self.config.lime_num_features,
+                    num_samples=self.config.lime_num_samples
+                )
+                
+                self._explanations.append({
+                    'instance_idx': i,
+                    'prediction': self.model.predict(X_explain[i:i+1])[0],
+                    'local_explanation': dict(exp.as_list()),
+                    'intercept': exp.intercept[0] if hasattr(exp, 'intercept') else None,
+                    'score': exp.score if hasattr(exp, 'score') else None
+                })
+            except Exception as e:
+                logger.warning(f"Failed to explain instance {i}: {e}")
+        
+        return self._explanations
+    
+    def aggregate_explanations(self) -> pd.DataFrame:
+        """Aggregate local explanations to get global feature importance."""
+        if not self._explanations:
+            raise ValueError("No explanations computed. Call explain_instances first.")
+        
+        # Collect all feature contributions with DIRECTION
+        all_contributions = {}
+        all_contributions_signed = {}  # NEW: Keep signed values
+        feature_frequency = {}  # NEW: How often feature appears in top-K
+        
+        for exp in self._explanations:
+            for feature, contribution in exp['local_explanation'].items():
+                if feature not in all_contributions:
+                    all_contributions[feature] = []
+                    all_contributions_signed[feature] = []
+                    feature_frequency[feature] = 0
+                
+                all_contributions[feature].append(abs(contribution))
+                all_contributions_signed[feature].append(contribution)  # NEW: Keep sign
+                feature_frequency[feature] += 1  # NEW: Count appearances
+        
+        # Calculate statistics
+        aggregated = []
+        for feature in all_contributions.keys():
+            mean_abs = np.mean(all_contributions[feature])
+            mean_signed = np.mean(all_contributions_signed[feature])  # NEW
+            std = np.std(all_contributions[feature])
+            
+            aggregated.append({
+                'feature': feature,
+                'lime_importance': mean_abs,
+                'mean_coefficient': mean_signed,  # NEW: Average direction
+                'lime_std': std,
+                'coefficient_of_variation': std / (mean_abs + 1e-10),  # NEW
+                'direction': 'Positive' if mean_signed > 0 else 'Negative',  # NEW
+                'frequency_in_explanations': feature_frequency[feature],  # NEW
+                'frequency_percentage': (feature_frequency[feature] / len(self._explanations)) * 100  # NEW
+            })
+        
+        df = pd.DataFrame(aggregated)
+        return df.sort_values('lime_importance', ascending=False).reset_index(drop=True)
+    
+    def generate_summary(self) -> Dict[str, Any]:
+        """Generate comprehensive LIME analysis summary."""
+        aggregated = self.aggregate_explanations()
+        
+        # Calculate fidelity metrics
+        fidelity_metrics = self._calculate_fidelity_metrics()
+        
+        # Feature consistency analysis
+        consistent_features = aggregated[
+            aggregated['coefficient_of_variation'] < 0.5
+        ].head(5)['feature'].tolist()
+        
+        variable_features = aggregated[
+            aggregated['coefficient_of_variation'] >= 1.0
+        ].head(5)['feature'].tolist()
+        
+        # Features that appear frequently in top explanations
+        frequent_features = aggregated[
+            aggregated['frequency_percentage'] > 50
+        ].head(5)['feature'].tolist()
+        
+        return {
+            "method": "LIME",
+            "mode": getattr(self, '_mode', 'unknown'),
+            "instances_explained": len(self._explanations),
+            "total_features": len(aggregated),
+            
+            # Top features with full info
+            "top_features": aggregated.head(self.config.top_n_features).to_dict('records'),
+            
+            # Directional summary (NEW)
+            "directional_summary": {
+                "positive_impact_features": int((aggregated['mean_coefficient'] > 0).sum()),
+                "negative_impact_features": int((aggregated['mean_coefficient'] < 0).sum()),
+                "strongest_positive": aggregated[aggregated['mean_coefficient'] > 0].head(3)['feature'].tolist(),
+                "strongest_negative": aggregated[aggregated['mean_coefficient'] < 0].head(3)['feature'].tolist(),
+            },
+            
+            # Consistency analysis
+            "consistency_analysis": {
+                "consistent_features": consistent_features,
+                "variable_features": variable_features,
+                "frequent_features": frequent_features,
+            },
+            
+            # Model fidelity (IMPROVED)
+            "model_fidelity": fidelity_metrics,
+            
+            # Feature importance concentration (NEW)
+            "concentration_metrics": self._calculate_lime_concentration(aggregated),
+            
+            # Interpretation
+            "interpretation": self._generate_interpretation(aggregated, fidelity_metrics)
+        }
+
+
+    def _calculate_lime_concentration(self, aggregated: pd.DataFrame) -> Dict[str, Any]:
+        """Calculate feature importance concentration metrics for LIME."""
+        n_features = len(aggregated)
+        total_importance = aggregated['lime_importance'].sum()
+        
+        metrics = {}
+        
+        # Top K percentages
+        for k in [1, 3, 5, 10]:
+            if k <= n_features:
+                top_k_pct = (
+                    aggregated.head(k)['lime_importance'].sum() / 
+                    total_importance * 100
+                )
+                metrics[f'top_{k}_percentage'] = float(top_k_pct)
+        
+        # Gini coefficient
+        sorted_importance = np.sort(aggregated['lime_importance'].values)
+        n = len(sorted_importance)
+        index = np.arange(1, n + 1)
+        gini = (2 * np.sum(index * sorted_importance)) / (n * np.sum(sorted_importance)) - (n + 1) / n
+        metrics['gini_coefficient'] = float(gini)
+        
+        return metrics
+    
+    def compare_with_true_predictions(self, X_explain: np.ndarray) -> Dict[str, Any]:
+        """Compare LIME's linear model predictions with actual model predictions."""
+        errors = []
+        
+        for exp in self._explanations:
+            idx = exp['instance_idx']
+            true_pred = exp['prediction']
+            
+            # LIME's linear approximation
+            lime_pred = exp.get('intercept', 0)
+            for feature, contribution in exp['local_explanation'].items():
+                lime_pred += contribution
+            
+            error = abs(true_pred - lime_pred)
+            errors.append(error)
+        
+        return {
+            "mean_approximation_error": float(np.mean(errors)),
+            "max_approximation_error": float(np.max(errors)),
+            "median_approximation_error": float(np.median(errors)),
+        }
+
+
+    def get_feature_stability(self) -> pd.DataFrame:
+        """Measure how stable feature importance is across instances."""
+        if not self._explanations:
+            raise ValueError("No explanations computed. Call explain_instances first.")
+        
+        feature_rankings = []
+        feature_appearances = {}  # Track which position each feature appears in
+        
+        for exp in self._explanations:
+            # Rank features by absolute contribution
+            ranked = sorted(
+                exp['local_explanation'].items(),
+                key=lambda x: abs(x[1]),
+                reverse=True
+            )
+            feature_rankings.append([f for f, _ in ranked])
+            
+            # Track positions for each feature
+            for position, (feature, _) in enumerate(ranked):
+                if feature not in feature_appearances:
+                    feature_appearances[feature] = []
+                feature_appearances[feature].append(position)
+        
+        # Calculate stability metrics for each feature
+        stability_data = []
+        
+        for feature, positions in feature_appearances.items():
+            n_appearances = len(positions)
+            appearance_rate = (n_appearances / len(self._explanations)) * 100
+            
+            # Mean and std of rank positions (lower = more important)
+            mean_position = np.mean(positions)
+            std_position = np.std(positions)
+            median_position = np.median(positions)
+            
+            # How often it appears in top 3
+            top3_count = sum(1 for p in positions if p < 3)
+            top3_rate = (top3_count / len(self._explanations)) * 100
+            
+            # How often it appears in top 5
+            top5_count = sum(1 for p in positions if p < 5)
+            top5_rate = (top5_count / len(self._explanations)) * 100
+            
+            # Stability score: High if appears often in similar positions
+            # Range 0-1, where 1 = perfectly stable
+            if std_position == 0 and appearance_rate == 100:
+                stability_score = 1.0
+            elif n_appearances < 2:
+                stability_score = 0.0
+            else:
+                # Normalized stability: penalize high std and low appearance rate
+                position_stability = 1 / (1 + std_position)
+                appearance_factor = appearance_rate / 100
+                stability_score = position_stability * appearance_factor
+            
+            stability_data.append({
+                'feature': feature,
+                'appearance_count': n_appearances,
+                'appearance_rate_%': appearance_rate,
+                'mean_rank_position': mean_position,
+                'median_rank_position': median_position,
+                'rank_position_std': std_position,
+                'top3_count': top3_count,
+                'top3_rate_%': top3_rate,
+                'top5_count': top5_count,
+                'top5_rate_%': top5_rate,
+                'stability_score': stability_score,
+                'stability_category': self._categorize_stability(stability_score, appearance_rate)
+            })
+        
+        # Create DataFrame and sort by stability score
+        stability_df = pd.DataFrame(stability_data)
+        stability_df = stability_df.sort_values('stability_score', ascending=False).reset_index(drop=True)
+        
+        # Calculate pairwise rank correlation across instances
+        rank_correlation = self._calculate_rank_correlation(feature_rankings)
+        
+        # Add summary statistics
+        stability_df.attrs['mean_rank_correlation'] = rank_correlation['mean_spearman']
+        stability_df.attrs['median_rank_correlation'] = rank_correlation['median_spearman']
+        stability_df.attrs['min_rank_correlation'] = rank_correlation['min_spearman']
+        
+        return stability_df
+
+
+    def _categorize_stability(self, stability_score: float, appearance_rate: float) -> str:
+        """Categorize feature stability."""
+        if stability_score >= 0.8 and appearance_rate >= 80:
+            return "Highly Stable"
+        elif stability_score >= 0.6 and appearance_rate >= 60:
+            return "Stable"
+        elif stability_score >= 0.4 and appearance_rate >= 40:
+            return "Moderately Stable"
+        elif stability_score >= 0.2:
+            return "Unstable"
+        else:
+            return "Highly Unstable"
+
+
+    def _calculate_rank_correlation(self, feature_rankings: List[List[str]]) -> Dict[str, float]:
+        """Calculate pairwise rank correlation between instances."""
+        from scipy.stats import spearmanr
+        from itertools import combinations
+        
+        if len(feature_rankings) < 2:
+            return {
+                'mean_spearman': 0.0,
+                'median_spearman': 0.0,
+                'min_spearman': 0.0,
+                'max_spearman': 0.0
+            }
+        
+        # Get all unique features
+        all_features = set()
+        for ranking in feature_rankings:
+            all_features.update(ranking)
+        all_features = sorted(list(all_features))
+        
+        # Convert feature rankings to numeric ranks
+        def ranking_to_numeric(ranking: List[str]) -> np.ndarray:
+            """Convert feature ranking to numeric array."""
+            rank_dict = {feature: idx for idx, feature in enumerate(ranking)}
+            # Features not in ranking get worst rank
+            worst_rank = len(ranking)
+            return np.array([rank_dict.get(f, worst_rank) for f in all_features])
+        
+        # Calculate all pairwise correlations
+        correlations = []
+        
+        for ranking1, ranking2 in combinations(feature_rankings, 2):
+            numeric1 = ranking_to_numeric(ranking1)
+            numeric2 = ranking_to_numeric(ranking2)
+            
+            # Calculate Spearman correlation
+            corr, _ = spearmanr(numeric1, numeric2)
+            
+            # Handle NaN (when all ranks are identical)
+            if not np.isnan(corr):
+                correlations.append(corr)
+        
+        if not correlations:
+            return {
+                'mean_spearman': 0.0,
+                'median_spearman': 0.0,
+                'min_spearman': 0.0,
+                'max_spearman': 0.0
+            }
+        
+        return {
+            'mean_spearman': float(np.mean(correlations)),
+            'median_spearman': float(np.median(correlations)),
+            'min_spearman': float(np.min(correlations)),
+            'max_spearman': float(np.max(correlations)),
+            'std_spearman': float(np.std(correlations))
+        }
+
+
+    def interpret_stability(self) -> str:
+        """Generate interpretation of feature stability analysis."""
+        stability_df = self.get_feature_stability()
+        
+        highly_stable = stability_df[stability_df['stability_category'] == 'Highly Stable']
+        unstable = stability_df[stability_df['stability_category'].isin(['Unstable', 'Highly Unstable'])]
+        
+        interpretation = f"Feature Stability Analysis across {len(self._explanations)} instances:\n\n"
+        
+        # Highly stable features
+        if len(highly_stable) > 0:
+            interpretation += f"✓ {len(highly_stable)} highly stable features: "
+            interpretation += f"{', '.join(highly_stable['feature'].head(5).tolist())}. "
+            interpretation += "These features consistently appear in top positions across instances.\n\n"
+        else:
+            interpretation += "⚠️ No highly stable features detected. Feature importance varies significantly across instances.\n\n"
+        
+        # Unstable features
+        if len(unstable) > 0:
+            interpretation += f"⚠️ {len(unstable)} unstable features: "
+            interpretation += f"{', '.join(unstable['feature'].head(5).tolist())}. "
+            interpretation += "These features show inconsistent importance across instances.\n\n"
+        
+        # Rank correlation
+        mean_corr = stability_df.attrs.get('mean_rank_correlation', 0)
+        interpretation += f"Mean pairwise rank correlation: {mean_corr:.3f}. "
+        
+        if mean_corr > 0.7:
+            interpretation += "High correlation indicates consistent feature rankings across instances."
+        elif mean_corr > 0.4:
+            interpretation += "Moderate correlation suggests some variability in feature rankings."
+        else:
+            interpretation += "Low correlation indicates high variability - feature importance is context-dependent."
+        
+        # Top features that appear consistently
+        top_consistent = stability_df[
+            (stability_df['top3_rate_%'] > 50) & 
+            (stability_df['stability_score'] > 0.6)
+        ]
+        
+        if len(top_consistent) > 0:
+            interpretation += f"\n\nMost reliable features (consistently in top 3): "
+            interpretation += f"{', '.join(top_consistent['feature'].tolist())}"
+        
+        return interpretation
+
+    def _generate_interpretation(
+        self, 
+        aggregated: pd.DataFrame, 
+        fidelity_metrics: Dict[str, Any]
+    ) -> str:
+        """Generate human-readable interpretation."""
+        n_features = len(aggregated)
+        
+        if n_features == 0:
+            return "No features available for interpretation."
+        
+        # Top features
+        top_n = min(3, n_features)
+        top = aggregated.head(top_n)
+        
+        interpretation = f"LIME local analysis across {len(self._explanations)} instances reveals: "
+        
+        # Top features with direction
+        for idx, row in top.iterrows():
+            direction = "increases" if row['mean_coefficient'] > 0 else "decreases"
+            interpretation += f"{row['feature']} {direction} predictions (importance: {row['lime_importance']:.4f}, appears in {row['frequency_percentage']:.1f}% of explanations). "
+        
+        # Fidelity assessment
+        mean_fidelity = fidelity_metrics.get('mean_r2')
+        if mean_fidelity is not None:
+            interpretation += f"\n\nLocal model fidelity: R² = {mean_fidelity:.3f}. "
+            interpretation += fidelity_metrics.get('interpretation', '')
+        
+        # Consistency analysis
+        high_variability = aggregated[
+            aggregated['coefficient_of_variation'] > 1.0
+        ]
+        
+        if len(high_variability) > 0:
+            interpretation += f"\n\nHigh variability features (inconsistent across instances): {', '.join(high_variability['feature'].head(3).tolist())}. This suggests context-dependent effects."
+        
+        # Concentration
+        if n_features >= 5:
+            top_5_pct = aggregated.head(5)['lime_importance'].sum() / aggregated['lime_importance'].sum() * 100
+            expected_pct = (5 / n_features) * 100
+            concentration_ratio = top_5_pct / expected_pct if expected_pct > 0 else 0
+            
+            if concentration_ratio > 2.5:
+                interpretation += f"\n\nHigh concentration: Top 5 features account for {top_5_pct:.1f}% of local importance. Local decisions rely on few features."
+            elif concentration_ratio < 1.2:
+                interpretation += f"\n\nDistributed importance: Top 5 features only account for {top_5_pct:.1f}% of importance. Local decisions use many features."
+        
+        # Actionable recommendations
+        interpretation += "\n\nRecommendations: "
+        
+        if mean_fidelity and mean_fidelity < 0.6:
+            interpretation += "⚠️ Improve LIME fidelity by increasing num_samples or decreasing kernel_width. "
+        
+        if len(high_variability) > 5:
+            interpretation += "Multiple features show context-dependent behavior - analyze these features across different subgroups. "
+        
+        return interpretation
+########################################################################################################
+
+# =============================================================================
+# Data Statistics Helper
+# =============================================================================
+
+def analyze_data_patterns(df: pd.DataFrame, target_col: str) -> Dict[str, Any]:
+    """
+    Analyze patterns in the data (matching reference implementation).
+    
+    Args:
+        df: DataFrame with data (pandas or PySpark)
+        target_col: Name of target column
+        
+    Returns:
+        Dictionary with data statistics
+    """
+    if df is None:
+        return {}
+    
+    # Convert PySpark DataFrame to pandas if needed
+    if hasattr(df, 'toPandas'):
+        df = df.toPandas()
+    
+    if df.empty:
+        return {}
+    
+    stats = {
+        "total_records": len(df),
+        "num_features": len(df.columns),
+        "missing_values": int(df.isnull().sum().sum())
+    }
+    
+    if target_col in df.columns:
+        target = df[target_col]
+        stats["target_stats"] = {
+            "mean": float(target.mean()),
+            "std": float(target.std()),
+            "min": float(target.min()),
+            "max": float(target.max()),
+            "trend": "Increasing" if target.tail(10).mean() > target.mean() else "Decreasing"
+        }
+    
+    return stats
+
+
+##############################
+####historical and lastest feature set
+
+
+def get_vintage_and_last_year_features(
+    historical_df: pd.DataFrame,
+    preprocessor,
+    feature_selector,
+    feature_names: list,
+    vintage_year: int,
+    vintage_month: int,
+    raw_feature_names: list = None
+) -> dict:
+    """
+    Fetches the transformed feature set for the latest (vintage) month and the same month last year.
+
+    Args:
+        historical_df: Input DataFrame with all data.
+        preprocessor: Fitted preprocessor (e.g., sklearn ColumnTransformer).
+        feature_selector: Optional fitted feature selector (e.g., SelectFromModel).
+        feature_names: List of final feature names after preprocessing/selection.
+        vintage_year: Year of the vintage month (int).
+        vintage_month: Month of the vintage (int, 1-12).
+        raw_feature_names: List of raw feature columns to use (optional).
+
+    Returns:
+        dict with:
+            - 'vintage_features': JSON (1 row, transformed)
+            - 'last_year_features': JSON (1 row, transformed)
+            - 'vintage_raw': JSON (1 row, raw)
+            - 'last_year_raw': JSON (1 row, raw)
+    """
+    if raw_feature_names is None:
+        raw_feature_names = [col.replace('recip_', '') for col in feature_names]
+        new_raw_feature_names = ["month_id"] + raw_feature_names + ["revenue","Forecast_yearly"]
+
+    vintage_mask = (historical_df['year'] == vintage_year) & (historical_df['month'] == vintage_month)
+    last_year_mask = (historical_df['year'] == (vintage_year - 1)) & (historical_df['month'] == vintage_month)
+
+    vintage_raw = historical_df.loc[vintage_mask, new_raw_feature_names].fillna(0)
+    last_year_raw = historical_df.loc[last_year_mask, new_raw_feature_names].fillna(0)
+
+    vintage_transformed = preprocessor.transform(vintage_raw)
+    last_year_transformed = preprocessor.transform(last_year_raw)
+
+    if feature_selector is not None:
+        vintage_transformed = feature_selector.transform(vintage_transformed)
+        last_year_transformed = feature_selector.transform(last_year_transformed)
+
+    vintage_features = pd.DataFrame(vintage_transformed, columns=feature_names)
+    last_year_features = pd.DataFrame(last_year_transformed, columns=feature_names)
+
+    return {
+        "vintage_features": vintage_features.to_json(orient="records",double_precision=2),
+        "last_year_features": last_year_features.to_json(orient="records",double_precision=2),
+        "vintage_raw": vintage_raw.to_json(orient="records",double_precision=2),
+        "last_year_raw": last_year_raw.to_json(orient="records",double_precision=2)
+    }
+
+
+#####################################
+
+# =============================================================================
+# Blob Storage Helper (Databricks)
+# =============================================================================
+
+def save_to_blob_storage(
+    container_name: str,
+    blob_name: str,
+    data: Dict[str, Any],
+    storage_account: str = None,
+    account_key: str = None
+):
+    """
+    Save JSON data to Azure Blob Storage using BlobServiceClient.
+    
+    Args:
+        container_name: Name of the blob container
+        blob_name: Name of the blob file
+        data: Dictionary to save as JSON
+        storage_account: Azure Storage account name (required)
+        account_key: Azure Storage account key (required)
+    """
+    try:
+        # Convert to JSON string
+        json_str = json.dumps(data, indent=2, default=str)
+        
+        # Validate required parameters
+        if not storage_account or not account_key:
+            raise ValueError("storage_account and account_key are required")
+        
+        # Use Azure Storage SDK with BlobServiceClient
+        from azure.storage.blob import BlobServiceClient, ContentSettings
+        
+        connection_string = (
+            f"DefaultEndpointsProtocol=https;"
+            f"AccountName={storage_account};"
+            f"AccountKey={account_key};"
+            f"EndpointSuffix=core.windows.net"
+        )
+        
+        blob_service_client = BlobServiceClient.from_connection_string(connection_string)
+        container_client = blob_service_client.get_container_client(container_name)
+        blob_client = container_client.get_blob_client(blob_name)
+        
+        blob_client.upload_blob(
+            json_str,
+            overwrite=True,
+            content_settings=ContentSettings(content_type="application/json")
+        )
+        logger.info(f"Saved to blob storage: {container_name}/{blob_name}")
+            
+    except Exception as e:
+        logger.error(f"Error saving to blob storage: {e}", exc_info=True)
+        raise
+
+################################################
+# =============================================================================
+# Main Pipeline
+# =============================================================================
+import re
+
+def _lime_feature_string_to_original_scale(feature_str: str, feature_names: List[str], X_raw: pd.DataFrame) -> str:
+    """Convert a single LIME feature string from transformed values to original (inverse) scale."""
+    def to_raw_col(name: str) -> str:
+        return name[6:] if name.startswith("recip_") else name
+    # Match longest feature name first
+    for f in sorted(feature_names, key=len, reverse=True):
+        if f in feature_str:
+            raw_col = to_raw_col(f)
+            if raw_col not in X_raw.columns or X_raw.empty:
+                return feature_str
+            raw_val = float(X_raw[raw_col].iloc[0])
+            if abs(raw_val) >= 1000:
+                formatted = f"{raw_val:,.2f}"
+            else:
+                formatted = f"{raw_val:.4f}"
+            # Replace numeric part(s) (transformed) with original-scale value
+            numbers = re.findall(r"-?\d+\.?\d*", feature_str)
+            if len(numbers) == 1:
+                return re.sub(r"-?\d+\.?\d*", formatted, feature_str, count=1)
+            if len(numbers) >= 2:
+                return f"{f} = {formatted} (original scale)"
+            return feature_str
+    return feature_str
+
+def convert_lime_summary_to_original_scale(lime_summary: Dict, feature_names: List[str], X_raw: Optional[pd.DataFrame]) -> Dict:
+    """Replace transformed values in LIME top_features and interpretation with original-scale values."""
+    if X_raw is None or (hasattr(X_raw, 'empty') and X_raw.empty):
+        return lime_summary
+    out = dict(lime_summary)
+    if "top_features" in out and out["top_features"]:
+        out["top_features"] = [
+            {**r, "feature": _lime_feature_string_to_original_scale(r.get("feature", ""), feature_names, X_raw)}
+            for r in out["top_features"]
+        ]
+    if "interpretation" in out and out["interpretation"]:
+        def to_raw_col(name: str) -> str:
+            return name[6:] if name.startswith("recip_") else name
+        interp = out["interpretation"]
+        for f in sorted(feature_names, key=len, reverse=True):
+            raw_col = to_raw_col(f)
+            if raw_col not in X_raw.columns or X_raw.empty or f not in interp:
+                continue
+            raw_val = float(X_raw[raw_col].iloc[0])
+            formatted = f"{raw_val:,.2f}" if abs(raw_val) >= 1000 else f"{raw_val:.4f}"
+            # Replace "feature op number" or "feature (original scale: ...) op number" with "feature op raw_val"
+            pattern = re.escape(f) + r"\s*(?:\(original scale:\s*[^)]*\))?\s*([><=]+)\s*-?\d+\.?\d*"
+            interp = re.sub(pattern, lambda m: f + " " + m.group(1) + " " + formatted, interp, count=1)
+        out["interpretation"] = interp
+    def convert_string_list(lst):
+        if not lst or not isinstance(lst, list):
+            return lst
+        return [_lime_feature_string_to_original_scale(s, feature_names, X_raw) for s in lst]
+    
+    if "directional_summary" in out and isinstance(out["directional_summary"], dict):
+        ds = dict(out["directional_summary"])
+        if "strongest_positive" in ds:
+            ds["strongest_positive"] = convert_string_list(ds["strongest_positive"])
+        if "strongest_negative" in ds:
+            ds["strongest_negative"] = convert_string_list(ds["strongest_negative"])
+        out["directional_summary"] = ds
+    
+    if "consistency_analysis" in out and isinstance(out["consistency_analysis"], dict):
+        ca = dict(out["consistency_analysis"])
+        if "consistent_features" in ca:
+            ca["consistent_features"] = convert_string_list(ca["consistent_features"])
+        if "variable_features" in ca:
+            ca["variable_features"] = convert_string_list(ca["variable_features"])
+        if "frequent_features" in ca:
+            ca["frequent_features"] = convert_string_list(ca["frequent_features"])
+        out["consistency_analysis"] = ca
+    return out
+
+def run_shap_lime_analysis(
+    year: int,
+    month: int,
+    shap_container: str = "shap-results",
+    lime_container: str = "lime-results",
+    storage_account: str = None,
+    account_key: str = None,
+    config: InterpretabilityConfig = None
+):
+    """
+    Main function to run SHAP and LIME analysis and save results to blob storage.
+    
+    Args:
+        year: Year for analysis (e.g., 2024)
+        month: Month for analysis (1-12)
+        shap_container: Azure Blob Storage container for SHAP results
+        lime_container: Azure Blob Storage container for LIME results
+        storage_account: Azure Storage account name
+        account_key: Azure Storage account key
+        config: InterpretabilityConfig object (uses defaults if None)
+    """
+    if not (1 <= month <= 12):
+        raise ValueError(f"Invalid month: {month}. Must be between 1 and 12")
+    
+    if config is None:
+        config = InterpretabilityConfig()
+    
+    logger.info(f"Starting SHAP and LIME analysis for {year}-{month:02d}")
+    
+    # Step 1: Load model and data (PLACEHOLDER - replace with your code)
+    logger.info("Loading model and data...")
+    (
+        model, model_type, feature_names, preprocessor, feature_selector,
+        X_train, X_explain, y_train, y_explain,
+        df_data, target_col, model_metrics, months_lookback, X_explain_raw
+    ) = load_model_and_data()
+
+    # Call get_vintage_and_last_year_features and store result
+    vintage_features_dict = get_vintage_and_last_year_features(
+        historical_df=historical_df,
+        preprocessor=preprocessor,
+        feature_selector=feature_selector,
+        feature_names=feature_names,
+        vintage_year=year,
+        vintage_month=month
+    )
+    
+    # Ensure X_train and X_explain are numpy arrays
+    if isinstance(X_train, pd.DataFrame):
+        X_train = X_train.values
+    if isinstance(X_explain, pd.DataFrame):
+        X_explain = X_explain.values
+    
+    # Apply feature selection if needed
+    if feature_selector is not None:
+        X_train = feature_selector.transform(X_train) if hasattr(feature_selector, 'transform') else X_train
+        X_explain = feature_selector.transform(X_explain) if hasattr(feature_selector, 'transform') else X_explain
+    
+    # Step 2: Extract feature importance
+    logger.info("Extracting feature importance from model...")
+    feature_extractor = FeatureImportanceExtractor(model, feature_names)
+    feature_importance_summary = feature_extractor.importance_summary()
+    
+    # Step 3: Analyze data patterns
+    logger.info("Analyzing data patterns...")
+    data_stats = analyze_data_patterns(df_data, target_col)
+    
+    # Step 4: Run SHAP analysis
+    logger.info("Running SHAP analysis...")
+    shap_analyzer = SHAPAnalyzer(model, feature_names, config)
+    shap_analyzer.compute_shap_values(X_train, X_explain)
+    shap_summary = shap_analyzer.generate_summary()
+    
+    # Step 5: Run LIME analysis
+    logger.info("Running LIME analysis...")
+    lime_analyzer = LIMEAnalyzer(model, feature_names, config)
+    lime_analyzer.explain_instances(X_train, X_explain)
+    lime_summary = lime_analyzer.generate_summary()
+    # Convert LIME feature strings from transformed to original (inverse) scale
+    lime_summary = convert_lime_summary_to_original_scale(lime_summary, feature_names, X_explain_raw)
+    
+    # Step 6: Prepare metadata
+    metadata = {
+        "model_type": model_type,
+        "target_variable": target_col,
+        "months_lookback": months_lookback,
+        "total_records": len(df_data) if df_data is not None else 0,
+        "num_features": len(feature_names),
+        "feature_importance": {
+            "top_10_features": feature_importance_summary.get("top_10_features", [])
+        },
+        "data_stats": data_stats
+    }
+    
+    # Step 7: Build complete SHAP result with metadata
+    shap_result = {
+        **shap_summary,
+        "metadata": metadata,
+        "model_metrics": model_metrics,
+        "feature_importance": {
+            "top_10_features": feature_importance_summary.get("top_10_features", [])
+        },
+        "data_stats": data_stats,
+        "vintage_and_last_year_features": vintage_features_dict
+    }
+    
+    # Step 8: Build complete LIME result with metadata
+    lime_result = {
+        **lime_summary,
+        "metadata": metadata,
+        "model_metrics": model_metrics,
+        "feature_importance": {
+            "top_10_features": feature_importance_summary.get("top_10_features", [])
+        },
+        "data_stats": data_stats,
+        "vintage_and_last_year_features": vintage_features_dict
+    }
+    
+    # Step 9: Save to blob storage
+    shap_blob_name = f"shap_{year}_{month:02d}.json"
+    lime_blob_name = f"lime_{year}_{month:02d}.json"
+    
+    logger.info(f"Saving SHAP results to {shap_container}/{shap_blob_name}...")
+    save_to_blob_storage(
+        shap_container,
+        shap_blob_name,
+        shap_result,
+        storage_account,
+        account_key
+    )
+    
+    logger.info(f"Saving LIME results to {lime_container}/{lime_blob_name}...")
+    save_to_blob_storage(
+        lime_container,
+        lime_blob_name,
+        lime_result,
+        storage_account,
+        account_key
+    )
+    
+    logger.info(f"Successfully completed SHAP and LIME analysis for {year}-{month:02d}")
+    logger.info(f"SHAP results saved to: {shap_container}/{shap_blob_name}")
+    logger.info(f"LIME results saved to: {lime_container}/{lime_blob_name}")
+    
+    return shap_result, lime_result
+
+
+# =============================================================================
+#  Usage
+# =============================================================================
+
+if __name__ == "__main__":
+    #  configuration
+    YEAR = inference_year
+    MONTH = int(inference_month)
+    SHAP_CONTAINER = "shap-results"
+    LIME_CONTAINER = "lime-results"
+    STORAGE_ACCOUNT = "gtairnistorage"  # Replace with actual storage account
+    ACCOUNT_KEY = access_key  # Optional, can use dbutils secrets instead
+    
+    # Run analysis
+    try:
+        shap_result, lime_result = run_shap_lime_analysis(
+            year=YEAR,
+            month=MONTH,
+            shap_container=SHAP_CONTAINER,
+            lime_container=LIME_CONTAINER,
+            storage_account=STORAGE_ACCOUNT,
+            account_key=ACCOUNT_KEY
+        )
+        print("Analysis completed successfully!")
+    except NotImplementedError as e:
+        print(f"ERROR: {e}")
+        print("Please implement the load_model_and_data() function with your model loading code.")
+    except Exception as e:
+        print(f"ERROR: {e}")
+        raise
+
+
+###########################
+####summary
+
+"""
+Usage:
+  - As a module: from generate_ai_summary import generate_ai_summary
+
+Required env vars (or pass via credential overrides):
+  - Azure OpenAI: AZURE_OPENAI_API_KEY, AZURE_OPENAI_ENDPOINT
+  - Storage: AZURE_STORAGE_ACCOUNT_NAME + AZURE_STORAGE_ACCOUNT_KEY
+  Optional: AZURE_OPENAI_API_VERSION, AZURE_OPENAI_MODEL
+  Optional containers: SHAP_RESULTS_CONTAINER, LIME_RESULTS_CONTAINER, SUMMARY_RESULTS_CONTAINER
+"""
+from __future__ import annotations
+
+import asyncio
+import json
+import os
+import sys
+import inspect
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime
+from typing import Any, Dict, Optional, Tuple
+import yaml
+
+with open("prompts/ai_summary_prompts.yaml", "r") as file:
+    prompts_config = yaml.safe_load(file)
+
+# Optional dependencies
+try:
+    from azure.storage.blob import BlobServiceClient, ContentSettings
+    from azure.core.exceptions import ResourceNotFoundError
+    _AZURE_BLOB_AVAILABLE = True
+except ImportError:
+    _AZURE_BLOB_AVAILABLE = False
+
+try:
+    from openai import AzureOpenAI
+    _OPENAI_AVAILABLE = True
+except ImportError:
+    _OPENAI_AVAILABLE = False
+
+try:
+    from crewai import Agent, LLM
+    _CREWAI_AVAILABLE = True
+except ImportError:
+    _CREWAI_AVAILABLE = False
+
+
+# Configuration defaults
+DEFAULT_STORAGE_ACCOUNT = "gtairnistorage"
+DEFAULT_SHAP_CONTAINER = "shap-results"
+DEFAULT_LIME_CONTAINER = "lime-results"
+DEFAULT_SUMMARY_CONTAINER = "ai-summaries"
+DEFAULT_OPENAI_ENDPOINT = "https://replica.openai.azure.com/"
+DEFAULT_OPENAI_VERSION = "2024-08-01-preview"
+DEFAULT_OPENAI_MODEL = "gpt-4o"
+
+def _env(key: str, default: Optional[str] = None) -> Optional[str]:
+    v = os.environ.get(key)
+    return v.strip() if (v and isinstance(v, str)) else default
+
+def get_config(overrides: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    overrides = overrides or {}
+    cfg = {
+        "AZURE_STORAGE_ACCOUNT_NAME": _env("AZURE_STORAGE_ACCOUNT_NAME") or DEFAULT_STORAGE_ACCOUNT,
+        "AZURE_STORAGE_ACCOUNT_KEY": _env("AZURE_STORAGE_ACCOUNT_KEY"),
+        "AZURE_STORAGE_SAS_TOKEN": _env("AZURE_STORAGE_SAS_TOKEN"),
+        "SHAP_RESULTS_CONTAINER": _env("SHAP_RESULTS_CONTAINER") or DEFAULT_SHAP_CONTAINER,
+        "LIME_RESULTS_CONTAINER": _env("LIME_RESULTS_CONTAINER") or DEFAULT_LIME_CONTAINER,
+        "SUMMARY_RESULTS_CONTAINER": _env("SUMMARY_RESULTS_CONTAINER") or DEFAULT_SUMMARY_CONTAINER,
+        "AZURE_OPENAI_API_KEY": _env("AZURE_OPENAI_API_KEY"),
+        "AZURE_OPENAI_ENDPOINT": _env("AZURE_OPENAI_ENDPOINT") or DEFAULT_OPENAI_ENDPOINT,
+        "AZURE_OPENAI_API_VERSION": _env("AZURE_OPENAI_API_VERSION") or DEFAULT_OPENAI_VERSION,
+        "AZURE_OPENAI_MODEL": _env("AZURE_OPENAI_MODEL") or DEFAULT_OPENAI_MODEL,
+    }
+    for k, v in overrides.items():
+        if v is not None:
+            cfg[k] = v
+    return cfg
+
+
+# Blob helpers
+def _get_blob_client(cfg: Dict[str, Any]):
+    name = cfg.get("AZURE_STORAGE_ACCOUNT_NAME")
+    if not name:
+        return None
+    if not _AZURE_BLOB_AVAILABLE:
+        raise ImportError("azure-storage-blob not installed. pip install azure-storage-blob")
+    sas = cfg.get("AZURE_STORAGE_SAS_TOKEN")
+    key = cfg.get("AZURE_STORAGE_ACCOUNT_KEY")
+    if sas:
+        return BlobServiceClient(
+            account_url=f"https://{name}.blob.core.windows.net",
+            credential=sas,
+        )
+    if key:
+        conn = (
+            f"DefaultEndpointsProtocol=https;AccountName={name};"
+            f"AccountKey={key};EndpointSuffix=core.windows.net"
+        )
+        return BlobServiceClient.from_connection_string(conn)
+    return None
+
+
+def _ensure_container_exists(blob_client, container_name: str) -> None:
+    try:
+        container_client = blob_client.get_container_client(container_name)
+        container_client.get_container_properties()
+    except ResourceNotFoundError:
+        container_client.create_container()
+
+
+def _fetch_json_from_blob(
+    blob_client,
+    account_name: str,
+    container_name: str,
+    blob_name: str,
+) -> Dict[str, Any]:
+    container_client = blob_client.get_container_client(container_name)
+    blob_instance = container_client.get_blob_client(blob_name)
+    try:
+        content = blob_instance.download_blob().readall().decode("utf-8")
+        return json.loads(content)
+    except ResourceNotFoundError:
+        raise FileNotFoundError(f"Blob not found: {container_name}/{blob_name}")
+    except json.JSONDecodeError as e:
+        raise ValueError(f"Invalid JSON in {blob_name}: {e}")
+
+
+def _upload_text_to_blob(
+    blob_client,
+    account_name: str,
+    container_name: str,
+    blob_name: str,
+    content: str,
+    content_type: str = "text/markdown",
+) -> str:
+    _ensure_container_exists(blob_client, container_name)
+    container_client = blob_client.get_container_client(container_name)
+    blob_instance = container_client.get_blob_client(blob_name)
+    blob_instance.upload_blob(
+        content,
+        overwrite=True,
+        content_settings=ContentSettings(content_type=content_type),
+    )
+    return f"https://{account_name}.blob.core.windows.net/{container_name}/{blob_name}"
+
+
+# Format helpers
+def _extract_metadata_from_results(
+    shap_data: Dict[str, Any], lime_data: Dict[str, Any], shap_lime = 0
+) -> Tuple[Dict[str, Any], Dict[str, float]]:
+    """Extract metadata from SHAP/LIME results. Model metrics are not used (returned as empty dict)."""
+    metadata = {}
+    # Logic to switch between SHAP and LIME techniques
+    if shap_lime == 0:
+        data_to_use = shap_data
+    else:
+        data_to_use = lime_data
+
+    # Extract metadata
+    if "metadata" in data_to_use and data_to_use["metadata"]:
+        metadata.update(data_to_use["metadata"])
+    elif "model_info" in data_to_use and data_to_use["model_info"]:
+        metadata.update(data_to_use["model_info"])
+
+    # Extract feature_importance
+    if "feature_importance" in data_to_use:
+        metadata["feature_importance"] = data_to_use["feature_importance"]
+
+    # Extract data_stats
+    if "data_stats" in data_to_use:
+        metadata["data_stats"] = data_to_use["data_stats"]
+
+    # Extract vintage_and_last_year_features
+    if "vintage_and_last_year_features" in data_to_use:
+        if "vintage_features" in data_to_use["vintage_and_last_year_features"]:
+            metadata["vintage_features"] = data_to_use["vintage_and_last_year_features"]["vintage_features"]
+        if "last_year_features" in data_to_use["vintage_and_last_year_features"]:
+            metadata["last_year_features"] = data_to_use["vintage_and_last_year_features"]["last_year_features"]
+        if "vintage_raw" in data_to_use["vintage_and_last_year_features"]:
+            metadata["vintage_raw"] = data_to_use["vintage_and_last_year_features"]["vintage_raw"]
+        if "last_year_raw" in data_to_use["vintage_and_last_year_features"]:
+            metadata["last_year_raw"] = data_to_use["vintage_and_last_year_features"]["last_year_raw"]
+    return metadata, {}
+
+def month_id_map(month_id):
+    month_map = {1: "Jan", 2: "Feb", 3: "Mar", 4: "Apr", 5: "May", 6: "Jun", 7: "Jul", 8: "Aug", 9: "Sep", 10: "Oct", 11: "Nov", 12: "Dec"}
+    return month_map[month_id]
+
+def build_shap_payload_for_llm(shap_result: dict) -> str:
+    """
+    Build a minimal, narrative-friendly SHAP payload for the LLM from the full SHAP result.
+    """
+    if not shap_result or not isinstance(shap_result.get("top_features"), list):
+        return "SHAP analysis not available."
+
+    top_features = shap_result["top_features"]
+    if not top_features:
+        return "No SHAP features available."
+
+    # Total importance for percentage
+    total_importance = sum(f.get("shap_importance", 0) for f in top_features)
+    total_importance = total_importance or 1.0
+
+    lines = [
+        "SHAP analysis (1 sample, 10 features):",
+        "",
+        "Interpretation: " + (shap_result.get("interpretation") or "N/A"),
+        "",
+        "Top drivers (by impact):",
+    ]
+
+    for rank, f in enumerate(top_features, 1):
+        name = f.get("feature", "?")
+        direction = f.get("direction", "?")
+        imp = f.get("shap_importance", 0)
+        pct = (imp / total_importance) * 100
+        lines.append(f"  {rank}. {name} — {direction} ({pct:.1f}%)")
+
+    # Directional summary
+    directional = shap_result.get("directional_summary") or {}
+    pos = directional.get("strongest_positive") or []
+    neg = directional.get("strongest_negative") or []
+    lines.append("")
+    lines.append("Strongest positive: " + ", ".join(pos) if pos else "Strongest positive: —")
+    lines.append("Strongest negative: " + ", ".join(neg) if neg else "Strongest negative: —")
+
+    # One concentration line
+    conc = shap_result.get("concentration_metrics") or {}
+    top_5_pct = conc.get("top_5_percentage")
+    if top_5_pct is not None:
+        lines.append("")
+        lines.append(f"Top 5 features account for {top_5_pct:.1f}% of total importance.")
+
+    return "\n".join(lines)
+
+def _generate_summary_prompt(
+    shap_lime_data: Dict[str, Any],
+    metadata: Optional[Dict[str, Any]] = None,
+    model_metrics: Optional[Dict[str, float]] = None,
+) -> str:
+    vintage_data = metadata['vintage_raw']
+    print(f"vintage_data:\n{type(vintage_data)}")
+    last_year_data = metadata['last_year_raw']
+    print(f"last_year_data:\n{last_year_data}")
+    column_metadata = prompts_config.get("column_metadata", "")
+    main_prompt = prompts_config.get("main", "")
+    n_shot = prompts_config.get("example_summary", "")
+    instruction = prompts_config.get("instructions","")
+    explainable_ai_analysis = build_shap_payload_for_llm(shap_lime_data)    
+
+    final_prompt = main_prompt.format(
+        vintage_month=month_id_map(int(inference_month)),
+        vintage_year=inference_year,
+        column_metadata=column_metadata,
+        yearly_prediction=round(imputed_table['predicted_revenue'].sum(),2),
+        monthly_prediction=round(imputed_table[(imputed_table['vintage']==f"{inference_year}-{inference_month}") & (imputed_table['target_month']==f"{inference_year}-{inference_month}")]['predicted_revenue'].iloc[0],2),
+        vintage_data=vintage_data,
+        last_year_data=last_year_data,
+        example_summary=n_shot,
+        instructions=instruction,
+        explainable_ai_analysis=explainable_ai_analysis)
+    
+
+    # Simplified prompt generation
+    return final_prompt
+
+
+# Direct LLM fallback
+def _call_llm(prompt: str, cfg: Dict[str, Any]) -> str:
+    if not _OPENAI_AVAILABLE:
+        raise ImportError("openai not installed. pip install openai")
+    key = cfg.get("AZURE_OPENAI_API_KEY")
+    endpoint = cfg.get("AZURE_OPENAI_ENDPOINT")
+    if not key or not endpoint:
+        raise ValueError("AZURE_OPENAI_API_KEY and AZURE_OPENAI_ENDPOINT required")
+    client = AzureOpenAI(
+        api_key=key,
+        api_version=cfg.get("AZURE_OPENAI_API_VERSION", "2024-02-01"),
+        azure_endpoint=endpoint.rstrip("/"),
+    )
+    model = cfg.get("AZURE_OPENAI_MODEL", "gpt-4")
+    response = client.chat.completions.create(
+        model=model,
+        messages=[
+            {
+                "role": "system",
+                "content": (
+    "You are a business analyst who writes concise, non-technical executive summaries. "
+    "You explain complex analysis results in simple business language that any executive can understand. "
+    "You focus on business implications and actionable insights, never on technical details. "
+    "Your summary MUST be exactly 4–5 numbered bullet points. Each bullet must include concrete numbers, the year, and a quarterly comparison where relevant. "
+    "Use plain business language only; no model names or statistical jargon."
+),
+            },
+            {"role": "user", "content": prompt},
+        ],
+        temperature=0,
+        max_tokens=500,
+    )
+    return response.choices[0].message.content or ""
+
+
+# CrewAI multi-agent
+REVIEWER_EVALUATION_CRITERIA = """Evaluate this executive summary. Return APPROVED only if ALL of the following are true; otherwise return REJECTED with specific feedback:
+1. Format: Exactly 4–5 numbered bullet points (no long paragraphs).
+2. Content: Each bullet includes concrete numbers and the year.
+3. Comparison: Quarterly comparison is present where relevant.
+4. Language: Plain business language only; no technical jargon, model names, or statistical metrics.
+5. Length: Concise; no bullet is overly long.
+If any criterion fails, respond with REJECTED: followed by the specific feedback. If all pass, respond with APPROVED."""
+
+def _terminal(msg: str) -> None:
+    print(msg, flush=True)
+
+
+def _extract_raw_from_agent_output(output: Any) -> str:
+    """Get raw text from CrewAI Agent output (LiteAgentOutput or coroutine result)."""
+    if output is None:
+        return ""
+    if hasattr(output, "raw") and output.raw is not None:
+        return (output.raw or "").strip()
+    return str(output).strip()
+
+
+def _agent_kickoff(agent: "Agent", prompt: str) -> Any:
+    """
+    Run agent in a dedicated thread with its own event loop so we always properly
+    await kickoff_async. This avoids 'coroutine was never awaited' and
+    'a coroutine was expected, got LiteAgentOutput' in Jupyter/Databricks.
+    """
+    def _run_async_kickoff() -> Any:
+        async def _async_run() -> Any:
+            if hasattr(agent, "kickoff_async"):
+                return await agent.kickoff_async(prompt)
+            # Fallback: sync kickoff in thread (no running loop here)
+            return agent.kickoff(prompt)
+
+        return asyncio.run(_async_run())
+
+    def _run_sync_kickoff() -> Any:
+        return agent.kickoff(prompt)
+
+    try:
+        loop = asyncio.get_running_loop()
+        # We're inside Jupyter/Databricks - run in a thread with fresh event loop
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            return pool.submit(_run_async_kickoff).result()
+    except RuntimeError:
+        # No running loop - safe to call sync or run async ourselves
+        try:
+            result = agent.kickoff(prompt)
+            if inspect.iscoroutine(result):
+                return asyncio.run(result)
+            return result
+        except (ValueError, TypeError):
+            # If sync kickoff failed (e.g. "coroutine expected"), use async in this process
+            return _run_async_kickoff()
+
+
+def _get_azure_llm(cfg: Dict[str, Any]) -> "LLM":
+    if not _CREWAI_AVAILABLE:
+        raise ImportError("crewai not installed. pip install crewai")
+    endpoint = (cfg.get("AZURE_OPENAI_ENDPOINT") or "").rstrip("/")
+    if not endpoint:
+        raise ValueError("AZURE_OPENAI_ENDPOINT is not set")
+    if "AZURE_ENDPOINT" not in os.environ:
+        os.environ["AZURE_ENDPOINT"] = endpoint
+    if "AZURE_API_KEY" not in os.environ and cfg.get("AZURE_OPENAI_API_KEY"):
+        os.environ["AZURE_API_KEY"] = cfg["AZURE_OPENAI_API_KEY"]
+    return LLM(
+        model=f"azure/{cfg.get('AZURE_OPENAI_MODEL', 'gpt-4')}",
+        api_key=cfg.get("AZURE_OPENAI_API_KEY"),
+        base_url=endpoint,
+        api_version=cfg.get("AZURE_OPENAI_API_VERSION", "2024-02-01"),
+        temperature=0.0,
+    )
+
+
+def _create_generator_agent(llm: "LLM") -> "Agent":
+    return Agent(
+        role="Executive Summary Writer",
+        goal="Create concise, non-technical executive summaries that tell a business story",
+        backstory="""You are a seasoned business analyst who writes for C-level executives.
+        You translate complex analysis into plain language. You never use technical jargon.
+        You output exactly 4–5 numbered bullet points. Each bullet must include concrete numbers, the year, and quarterly comparison where relevant.
+        You focus on business implications and actionable insights. No flowing paragraphs; use only the numbered list format.""",
+        llm=llm,
+        verbose=True,
+        allow_delegation=False,
+    )
+
+
+def _create_reviewer_agent(llm: "LLM") -> "Agent":
+    return Agent(
+        role="Executive Summary Reviewer",
+        goal="Evaluate executive summaries against quality criteria and provide specific feedback",
+        backstory="""You are a strict quality reviewer for executive communications.
+        You evaluate summaries against clear criteria: non-technical language, baseline comparison,
+        top 3 drivers only, storytelling flow, length, and actionable insight.
+        You only approve when ALL criteria pass. You provide specific, actionable feedback when rejecting.""",
+        llm=llm,
+        verbose=True,
+        allow_delegation=False,
+    )
+
+
+def _evaluate_summary(reviewer_agent: "Agent", summary: str) -> Tuple[bool, str]:
+    summary = (summary or "").strip()
+    if not summary:
+        return (False, "The summary is empty. Please generate a complete executive summary.")
+
+    _terminal("\n" + "=" * 60)
+    _terminal("GENERATOR AGENT OUTPUT (submitted for review)")
+    _terminal("=" * 60)
+    _terminal(summary[:1500] + ("..." if len(summary) > 1500 else ""))
+    _terminal("")
+
+    evaluation_prompt = f"""You are evaluating an executive summary. Apply these criteria strictly.
+
+{REVIEWER_EVALUATION_CRITERIA}
+
+## Summary to Evaluate:
+{summary}
+
+## Your Evaluation (APPROVED or REJECTED with feedback):"""
+
+    try:
+        _terminal("--- Calling REVIEWER agent ---")
+        review_output = _agent_kickoff(reviewer_agent, evaluation_prompt)
+        raw_response = _extract_raw_from_agent_output(review_output)
+
+        _terminal("\n" + "-" * 60)
+        _terminal("REVIEWER AGENT RESPONSE")
+        _terminal("-" * 60)
+        _terminal(raw_response)
+        _terminal("")
+
+        review_text = raw_response.upper()
+        if "APPROVED" in review_text and "REJECTED" not in review_text:
+            _terminal(">>> Reviewer: APPROVED")
+            return (True, "")
+        if "REJECTED" in review_text:
+            feedback_start = raw_response.upper().find("REJECTED")
+            feedback = raw_response[feedback_start:].strip()
+            for prefix in ("REJECTED:", "REJECTED "):
+                if feedback.upper().startswith(prefix):
+                    feedback = feedback[len(prefix):].strip()
+                    break
+            _terminal(">>> Reviewer: REJECTED (Generator will retry with this feedback)")
+            return (False, feedback)
+        _terminal(">>> Reviewer: Unclear response (treated as REJECTED)")
+        return (False, f"Reviewer response was unclear. Improve the summary. Reviewer said: {raw_response[:300]}")
+    except Exception as e:
+        _terminal(f">>> Reviewer call failed: {e}")
+        return (False, f"Evaluation failed. Try again with a clearer summary. Error: {str(e)}")
+
+
+def _run_summary_crew(
+    generator_prompt: str,
+    target_variable: str,
+    cfg: Dict[str, Any],
+    max_attempts: int = 4,
+) -> str:
+    llm = _get_azure_llm(cfg)
+    generator = _create_generator_agent(llm)
+    reviewer = _create_reviewer_agent(llm)
+
+    _terminal("\n" + "#" * 60)
+    _terminal("CREW STARTED: Generator → Reviewer loop (async-safe)")
+    _terminal("#" * 60 + "\n")
+
+    feedback_for_next = ""
+    last_summary = ""
+
+    for attempt in range(1, max_attempts + 1):
+        _terminal(f"\n>>> Attempt {attempt}/{max_attempts}")
+
+        if attempt == 1:
+            prompt = generator_prompt
+        else:
+            prompt = generator_prompt + f"""
+
+---
+[REVISE YOUR PREVIOUS SUMMARY]
+Your previous summary was rejected. Revise it to address the reviewer feedback.
+
+Your previous summary:
+{last_summary}
+
+Reviewer feedback:
+{feedback_for_next}
+
+---
+Output your revised executive summary below (full text). Same rules: under 200 words, plain business language, flowing paragraphs, top 3 drivers, one actionable insight."""
+
+        _terminal("--- Calling GENERATOR agent ---")
+        gen_output = _agent_kickoff(generator, prompt)
+        last_summary = _extract_raw_from_agent_output(gen_output)
+
+        _terminal("\n" + "=" * 60)
+        _terminal("GENERATOR AGENT finished")
+        _terminal("=" * 60)
+        _terminal(last_summary[:1500] + ("..." if len(last_summary) > 1500 else ""))
+        _terminal("")
+
+        if not last_summary:
+            feedback_for_next = "The summary was empty. Please output a full executive summary."
+            continue
+
+        eval_result = _evaluate_summary(reviewer, last_summary)
+        if eval_result is None:
+            approved, feedback_for_next = False, "Evaluation failed (no response from reviewer)."
+        else:
+            approved, feedback_for_next = eval_result
+        if approved:
+            _terminal("\n" + "#" * 60)
+            _terminal("CREW FINISHED: Final summary approved.")
+            _terminal("#" * 60)
+            return last_summary
+
+    _terminal("\n" + "#" * 60)
+    _terminal("CREW FINISHED: Max attempts reached without approval. Returning last summary.")
+    _terminal("#" * 60)
+    return last_summary or "Unable to generate an approved summary."
+
+
+# Main entry
+def generate_ai_summary(
+    year: int,
+    month: int,
+    metadata: Optional[Dict[str, Any]] = None,
+    model_metrics: Optional[Dict[str, float]] = None,
+    use_crew: bool = True,
+    upload_to_blob: bool = True,
+    shap_lime: int = 0,
+    **credential_overrides: Any,
+) -> Dict[str, Any]:
+    if not (1 <= month <= 12):
+        raise ValueError(f"Invalid month: {month}. Must be between 1 and 12")
+
+    cfg = get_config(credential_overrides)
+    shap_container = cfg["SHAP_RESULTS_CONTAINER"]
+    lime_container = cfg["LIME_RESULTS_CONTAINER"]
+    summary_container = cfg["SUMMARY_RESULTS_CONTAINER"]
+    shap_blob_name = f"shap_{year}_{month:02d}.json"
+    lime_blob_name = f"lime_{year}_{month:02d}.json"
+    summary_blob_name = f"summary_{year}_{month:02d}.md"
+
+    # 1) Fetch SHAP and LIME
+    blob_client = _get_blob_client(cfg)
+    account_name = cfg["AZURE_STORAGE_ACCOUNT_NAME"]
+    shap_data = _fetch_json_from_blob(blob_client, account_name, shap_container, shap_blob_name)
+    lime_data = _fetch_json_from_blob(blob_client, account_name, lime_container, lime_blob_name)
+    if shap_lime == 0:
+        explain_ai_data = shap_data
+    else:
+        explain_ai_data = lime_data
+    # 2) Merge metadata (no model metrics used)
+    extracted_metadata, _ = _extract_metadata_from_results(shap_data, lime_data, shap_lime)
+    final_metadata = {**extracted_metadata, **(metadata or {})}
+
+    # 3) Build prompt
+    prompt = _generate_summary_prompt(explain_ai_data, metadata=final_metadata)
+    print(f"for shap_lime value {shap_lime}, the prompt is:\n {prompt}")
+    target_variable = final_metadata.get("target_variable", "revenue")
+
+    # 4) Generate summary
+    if use_crew and _CREWAI_AVAILABLE:
+        try:
+            summary_text = _run_summary_crew(prompt, target_variable, cfg)
+        except TypeError as e:
+            if "NoneType" in str(e) and "not iterable" in str(e):
+                # CrewAI can return None or cause iteration over None; fall back to direct LLM
+                summary_text = _call_llm(prompt, cfg)
+            else:
+                raise
+    else:
+        summary_text = _call_llm(prompt, cfg)
+
+    # 5) Optionally upload to blob
+    blob_url = None
+    if upload_to_blob:
+        blob_url = _upload_text_to_blob(
+            blob_client, account_name, summary_container, summary_blob_name, summary_text
+        )
+
+    return {
+        "success": True,
+        "message": "Summary generated and uploaded successfully" if upload_to_blob else "Summary generated successfully",
+        "summary": summary_text,
+        "blob_url": blob_url,
+        "container": summary_container,
+        "blob_name": summary_blob_name,
+        "year": year,
+        "month": month,
+        "generated_at": datetime.now().isoformat(),
+    }
+
+
+def generate_summary_safe(
+    year: int,
+    month: int,
+    use_crew: bool = False,
+    upload_to_blob: bool = False,
+):
+    """
+    Safe wrapper around generate_ai_summary that doesn't call sys.exit().
+
+    Args:
+        year: Year (e.g. 2024, 2026)
+        month: Month 1-12
+        use_crew: If True, use CrewAI multi-agent (Generator + Reviewer). Default False.
+                  With the async fix, use_crew=True should work in Jupyter/Databricks.
+        upload_to_blob: If True, upload to blob storage. Default False.
+
+    Returns:
+        dict: Result dictionary with success, summary, and error (if any)
+    """
+    try:
+        print(f"\n{'='*70}")
+        print(f"Starting AI Summary Generation for {year}-{month:02d}")
+        print(f"Mode: {'CrewAI Multi-Agent' if use_crew else 'Direct Azure OpenAI'}")
+        print(f"Upload to Blob: {'Yes' if upload_to_blob else 'No'}")
+        print(f"{'='*70}\n")
+
+        result = generate_ai_summary(
+            year=year,
+            month=month,
+            use_crew=use_crew,
+            upload_to_blob=upload_to_blob,
+            shap_lime=0
+        )
+
+        print(f"\n{'='*70}")
+        print("✓ SUMMARY GENERATED SUCCESSFULLY")
+        print(f"{'='*70}\n")
+        print(result["summary"])
+        print(f"\n{'='*70}")
+
+        if result.get("blob_url"):
+            print(f"\n Uploaded to: {result['blob_url']}")
+
+        print(f"\n✓ Generation completed at: {result.get('generated_at', 'N/A')}")
+        print(f"{'='*70}\n")
+
+        return result
+
+    except FileNotFoundError as e:
+        error_msg = f"Required data files not found: {str(e)}"
+        print(f"\n{'='*70}")
+        print("✗ ERROR: Missing Data Files")
+        print(f"{'='*70}")
+        print(f"\n{error_msg}")
+        print(f"\nPlease ensure SHAP and LIME results exist for {year}-{month:02d}")
+        print(f"Expected files: shap_{year}_{month:02d}.json, lime_{year}_{month:02d}.json")
+        print(f"{'='*70}\n")
+
+        return {
+            "success": False,
+            "error": str(e),
+            "error_type": "FileNotFoundError",
+            "message": error_msg,
+            "year": year,
+            "month": month
+        }
+
+    except ImportError as e:
+        error_msg = f"Missing required package: {str(e)}"
+        print(f"\n{'='*70}")
+        print("✗ ERROR: Missing Dependencies")
+        print(f"{'='*70}")
+        print(f"\n{error_msg}")
+
+        if "crewai" in str(e).lower():
+            print("\nTo use CrewAI mode, install: pip install crewai crewai[azure-ai-inference]")
+            print("Or set use_crew=False to use direct LLM mode")
+        elif "openai" in str(e).lower():
+            print("\nInstall OpenAI: pip install openai")
+        elif "azure" in str(e).lower():
+            print("\nInstall Azure Storage: pip install azure-storage-blob")
+
+        print(f"{'='*70}\n")
+
+        return {
+            "success": False,
+            "error": str(e),
+            "error_type": "ImportError",
+            "message": error_msg,
+            "year": year,
+            "month": month
+        }
+
+    except ValueError as e:
+        error_msg = f"Invalid input or configuration: {str(e)}"
+        print(f"\n{'='*70}")
+        print("✗ ERROR: Invalid Input")
+        print(f"{'='*70}")
+        print(f"\n{error_msg}")
+        print(f"{'='*70}\n")
+
+        return {
+            "success": False,
+            "error": str(e),
+            "error_type": "ValueError",
+            "message": error_msg,
+            "year": year,
+            "month": month
+        }
+
+    except Exception as e:
+        error_msg = f"Unexpected error: {str(e)}"
+        print(f"\n{'='*70}")
+        print("✗ ERROR: Generation Failed")
+        print(f"{'='*70}")
+        print(f"\nError Type: {type(e).__name__}")
+        print(f"Message: {error_msg}")
+        print(f"{'='*70}\n")
+
+        return {
+            "success": False,
+            "error": str(e),
+            "error_type": type(e).__name__,
+            "message": error_msg,
+            "year": year,
+            "month": month
+        }
