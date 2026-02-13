@@ -1,0 +1,365 @@
+
+
+## NOTEBOOK OVERVIEW
+
+**Purpose:** This Databricks notebook implements an end-to-end ML pipeline for **enterprise revenue forecasting**. It ingests monthly FP&A (Financial Planning & Analysis) data, validates its quality, transforms and engineers features, runs ML model inference to predict future monthly revenues, produces forecast outputs with confidence intervals, performs model interpretability (SHAP/LIME), and generates AI-powered executive summaries.
+
+**Platform:** Azure Databricks (PySpark + Pandas)
+**Storage:** Azure Blob Storage (ABFSS paths) + Unity Catalog Delta Tables
+**Data Period (this run):** January 2026 vintage forecast
+
+---
+
+## CELL 1 -- "Key"
+
+**What it does:** Stores the Azure Storage Account access key as a Python variable `access_key`. This key is used throughout the notebook to authenticate against the Azure Blob Storage account `gtairnistorage`.
+
+**Why we use it:** All subsequent cells that read/write to Azure Blob Storage (logs, data quality reports, SHAP/LIME results, AI summaries) need this authentication credential.
+
+**Where results are stored:** Variable `access_key` (in-memory string).
+
+**Note:** Storing keys directly in code is a security concern -- production setups should use Azure Key Vault or Databricks secrets.
+
+---
+
+## CELL 2 -- "Logging"
+
+**What it does:** Sets up a centralized cloud-based logging system. It defines a custom `AzureBlobHandler` class that inherits from Python's `logging.Handler`. Every time a log message is emitted, this handler downloads the current blob log file, appends the new log entry, and re-uploads it. The log file is named by date (e.g., `custom_log_2026-02-12.log`) and stored in the `dbnotebook-logs` container under `logs_model/`.
+
+**Why we use it:** To persist all pipeline execution logs in Azure Blob Storage so they can be audited, debugged, or reviewed after the notebook run completes -- even if the Databricks cluster is terminated.
+
+**Where results are stored:**
+- Variable: `logger` (Python logger object)
+- Variable: `connection_string` (reused by later cells)
+- Azure Blob: `wasbs://dbnotebook-logs@gtairnistorage.blob.core.windows.net/logs_model/custom_log_YYYY-MM-DD.log`
+
+---
+
+## CELL 3 -- "Widget for Incremental File Path"
+
+**What it does:** Creates three Databricks interactive widgets: `input_file_path` (text), `trigger_flag` (dropdown: True/False), and `alternative_file_path` (text with a default path). Based on `trigger_flag`:
+- If **True**: Recursively lists all files under `input_file_path`, finds the **most recently modified file** (by modification timestamp), and uses that as the data source.
+- If **False**: Uses the hardcoded `alternative_file_path` directly.
+
+**Why we use it:** This enables the pipeline to work in two modes -- (1) triggered by an automated process that drops a new file (uses latest file detection) or (2) run manually with a specific file path. This is the entry point where the **input data source is determined**.
+
+**Where results are stored:** Variable `full_path` = the resolved ABFSS path to the CSV file to process (e.g., `abfss://historicaldata@gtairnistorage.dfs.core.windows.net/monthly_data/2026/Jan/Forecast_Jan'26.csv`).
+
+---
+
+## CELL 4 -- "Data Analyzer" (Data Quality)
+
+**What it does:** This is a large, comprehensive cell that defines and runs the `DataQualityAnalyzer` class. The class performs **20 data quality checks** on the raw input CSV file:
+
+1. **Shape Info** -- Reports total rows (2,406) and columns (43), confirms 14 required columns exist.
+2. **Column Signature** -- Checks all 14 required columns (Revenue_Category, ProbabilityPer, Forecast_Jan through Forecast_Dec) are present.
+3. **Null Analysis** -- Flags columns exceeding 20% null threshold (ProbabilityPer at 66.8% nulls is flagged).
+4. **Data Type Check** -- Verifies Forecast columns are numeric, not object/string.
+5. **Zero Forecast Rows** -- Detects rows where all 12 forecast months are zero (found 1 row in "Un-id" category).
+6. **Revenue Category Distribution** -- Shows breakdown: Committed-Signed (38.6%), Un-id (25.8%), Wtd. Pipeline (21.2%), Committed-Unsigned (14.4%).
+7. **Descriptive Statistics** -- Runs `.describe()` on all 14 required columns.
+8. **Sample Data** -- Shows first 5 rows for visual inspection.
+9. **Health Score** -- Aggregates all checks into a 0-100 score (scored **97/100 = HEALTHY**).
+10. **Duplicate Detection** -- Found 120 duplicate rows (5.0%).
+11. **Row Count Range** -- Validates total rows are between 1,000-100,000.
+12. **Column Name Issues** -- Checks for whitespace/case mismatches.
+13. **Negative Forecast Values** -- Found 704 negative values across forecast columns.
+14. **Infinity Values** -- None detected.
+15. **Probability Range** -- All values between 0-1 (decimal format).
+16. **Unexpected Categories** -- All categories are recognized.
+17. **Categorical Whitespace** -- No whitespace issues.
+18. **Dead Columns** -- No 100%-null required columns.
+19. **Outlier Detection (IQR x3)** -- Found outliers in all 12 forecast columns.
+20. **Zero-Variance** -- No constant-value columns.
+
+**Why we use it:** This is a **data validation gate**. If the health score drops below 50, the pipeline can be configured to halt, preventing garbage-in-garbage-out predictions. It also produces an audit trail.
+
+**Where results are stored:**
+- Variable: `dq_report` (Python dict with all check results)
+- Azure Blob JSON: `wasbs://dbnotebook-logs@gtairnistorage.blob.core.windows.net/dq/2026/Jan/dq_report_2026_Jan_20260212_080028.json`
+
+---
+
+## CELL 5 -- "Transformation Script on Incremental Data"
+
+**What it does:** Defines the `DataTransformer` class -- the core data engineering engine. This class handles the entire transformation and feature engineering pipeline with these key capabilities:
+
+- **Data Loading:** Reads raw data from ABFSS paths (CSV/Parquet/Excel) using Spark, converts to Pandas. Also reads historical transformed data from a Delta table.
+- **Data Refinement Pipeline (4 steps):**
+  1. **Filter** -- Removes rows with Revenue_Category = 'Risk', 'Opportunity', 'Un-id' (removed 620 rows).
+  2. **Normalize Probability** -- Converts decimal probabilities (0.5) to percentages (50).
+  3. **Remove Empty Forecast Rows** -- Drops rows where category='-' and all forecasts are zero.
+  4. **Replace Category** -- Renames '-' to 'Actuals'.
+- **Lag Feature Generation** (28 features): LM1/LM2/LM3 (last 1-3 months revenue), YTD, LY1/LY2 (last year/2 years full-year revenue), LY1CM/LY2CM (same month last/2 years), deltas, rolling standard deviations (3M/6M), YoY growth rates, trend slopes, and more. Handles year boundary wrap-around intelligently (e.g., for January, LM1=December of previous year pulled from historical data).
+- **Revenue-Based Features** (21 features): Committed-Signed/Unsigned/Pipeline revenue ratios, forecast sums per month, rest-of-year forecast, year-end projections, forecast gaps, previous month achievement percentage.
+- **Probability Features:** Mean probability percentage for Weighted Pipeline deals.
+- **Time Features:** Year, month, month_id.
+
+**Why we use it:** To convert raw FP&A forecast data into a single-row **feature vector (60 features)** that the ML model can consume for prediction. The features capture temporal patterns, year-over-year trends, revenue composition, and pipeline health.
+
+**Where results are stored:** Class definition only -- instantiated in the next cell.
+
+---
+
+## CELL 6 -- "Calling Transformation"
+
+**What it does:** Instantiates `DataTransformer` with:
+- `RAW_DATA_PATH` = the resolved `full_path` from Cell 3
+- `HISTORICAL_DATA_PATH` = `fpnacopilot.data_engineering.transform_data` (a Unity Catalog Delta table)
+
+Then calls `transformer.get_all_features(prob_pct_method="mean")`, which executes the full 6-step pipeline:
+1. Fetches historical data (37 rows x 66 columns, covering 2023-2025)
+2. Fetches raw data (2,406 rows x 43 columns)
+3. Refines to 1,786 rows
+4. Extracts year=2026, month=1 from path
+5. Generates all 60 features
+6. Returns `features_df` (1 row x 60 columns)
+
+**Key Output Values (Jan 2026):** Revenue = 170.8M, LM1 = 182.8M (Dec 2025), LY1 = 2.09B (full year 2025), Committed-Signed ratio = 64.1%, YoY growth = 12.85%, Forecast yearly = 2.09B.
+
+**Where results are stored:** Variable `features_df` (single-row Pandas DataFrame with 60 features). Displayed in notebook output.
+
+---
+
+## CELL 7 -- "Upsert for Transformed Delta Table"
+
+**What it does:** Takes the `features_df` generated in Cell 6 and **upserts** it into the Delta table `fpnacopilot.data_engineering.transform_data`. The merge logic matches on `year` and `month` -- if a row for 2026-01 already exists, it updates it; otherwise, it inserts a new row. Also creates **placeholder rows** for future months (2026-02 through 2026-12) with null values, preparing the structure for future runs.
+
+**Why we use it:** This is the **persistence layer** -- it stores the feature set in a Delta table so that: (1) future pipeline runs can access historical features, (2) the model has a complete time series for lookups, and (3) a full audit trail exists.
+
+**Where results are stored:** Delta table `fpnacopilot.data_engineering.transform_data` (37 rows total after upsert, covering Jan 2023 through Dec 2026 with nulls for future months).
+
+---
+
+## CELL 8 -- "Creating Future Month Year Structure"
+
+**What it does:** Reads and displays the entire `transform_data` Delta table after the upsert. Shows the complete dataset from Jan 2023 to Dec 2026 -- historical months have full feature values, while future months (Feb 2026 onward) have all nulls, serving as placeholders.
+
+**Why we use it:** Visual validation that the upsert completed correctly and the Delta table structure is intact.
+
+**Where results are stored:** Display only (no new variables or storage).
+
+---
+
+## CELL 9 -- (Untitled) Load Historical Data
+
+**What it does:** Loads the `transform_data` Delta table into a Pandas DataFrame `historical_df` for use by the model inference cells.
+
+**Where results are stored:** Variable `historical_df`.
+
+---
+
+## CELL 10 -- "Parameterization"
+
+**What it does:** Loads model configuration from the Delta table `fpnacopilot.data_engineering.model_config`. Extracts `trained_year` and `test_year` from the config, and derives the inference period (`inference_year=2026`, `inference_month=1`, `month_id="2026-01"`) from the `full_path`.
+
+**Why we use it:** Centralizes all configuration (which year the model was trained on, which year it's being tested on, and which period is being forecast) so changes can be made in the config table without editing code.
+
+**Where results are stored:** Variables `model_config`, `trained_year`, `test_year`, `inference_year`, `inference_month`, `month_id`.
+
+---
+
+## CELL 11 -- "Reciprocal Transformer"
+
+**What it does:** Defines three key classes:
+1. **`ReciprocalTransformer`** -- An sklearn-compatible transformer that computes 1/x (with epsilon to avoid division by zero). Used in the preprocessing pipeline.
+2. **`ImputationConfig`** -- Configuration dataclass for feature imputation during inference (specifying how missing features in future months should be filled).
+3. **`RegressionPipelineConfig`** -- Master configuration for the ML pipeline: target column (`revenue`), date columns, train/test year splits, scaling method, feature selection approach, model hyperparameters, etc.
+
+**Why we use it:** Provides the mathematical transforms and configuration scaffolding that the trained model expects during inference.
+
+**Where results are stored:** Class definitions only (no runtime data).
+
+---
+
+## CELL 12 -- "Loading Trained Model"
+
+**What it does:** Loads the pre-trained ML model artifact from Azure/MLflow model registry. Also loads the associated preprocessor (scaler + feature selector) so that inference data can be transformed identically to training data.
+
+**Where results are stored:** Variables for model object, preprocessor, and feature configuration.
+
+---
+
+## CELL 13 -- "Imputation & Inference"
+
+**What it does:** This is the **core prediction engine**. It performs recursive forecasting starting from the vintage month (Jan 2026) through December 2026. For each future month:
+1. **Imputes missing features** -- Since future months don't have actual data yet, features like LM1, YTD, etc. are imputed using predicted values from previous iterations.
+2. **Applies the trained model** to generate a point prediction.
+3. **Calculates prediction intervals** at 65%, 75%, 85%, and 95% confidence levels using z-score-based intervals.
+4. Logs each month's prediction and feature values.
+
+**Why we use it:** This is where the actual **revenue forecasting happens**. The recursive approach allows predicting multiple months into the future, where each month's prediction feeds into the next month's feature set.
+
+**Where results are stored:** Variable `imputed_table` (DataFrame with columns: vintage, target_month, predicted_revenue, confidence intervals, and all feature values per month).
+
+---
+
+## CELL 14 -- "Creation of Forecast Output"
+
+**What it does:** Takes the `imputed_table` from the inference step and constructs the final forecast output DataFrame. Key computations:
+- **fpna_forecast** -- The FP&A-adjusted forecast
+- **absolute_model_forecast** -- Raw model prediction
+- **margin_of_error** -- Prediction uncertainty
+- **delta_forecast** -- Difference between model and FP&A forecast
+- **feature_set** -- A JSON blob containing per-month features and predictions (enables downstream consumers to inspect what drove each prediction)
+- Aggregates to yearly totals
+
+**Why we use it:** Transforms raw model outputs into business-consumable forecast results with proper formatting and metadata.
+
+**Where results are stored:** Variable `forecast_result_df`.
+
+---
+
+## CELL 15 -- "Upsert Logic of Forecast Output Delta Table"
+
+**What it does:** Upserts `forecast_result_df` into the Delta table `fpnacopilot.data_engineering.enterprise_forecast_output`. The merge key is `(year, month, identifier)`. Existing rows are updated, new rows are inserted.
+
+**Why we use it:** This is the **final output persistence** -- the forecast results are stored in a Delta table that downstream consumers (dashboards, reports, APIs) can query.
+
+**Where results are stored:** Delta table `fpnacopilot.data_engineering.enterprise_forecast_output`.
+
+---
+
+## CELL 16 -- "Load Data and Model" (for Interpretability)
+
+**What it does:** Defines `load_model_and_data()` function that loads the model artifact, preprocessor, and historical data. Splits data into train/test/inference sets and applies preprocessing. Returns everything needed for SHAP and LIME analysis.
+
+**Why we use it:** Prepares a clean, consistent data environment for model interpretability analysis.
+
+**Where results are stored:** Function definition; outputs consumed by SHAP/LIME cells.
+
+---
+
+## CELL 17 -- "Feature Importance"
+
+**What it does:** Computes and displays feature importance from the trained model (likely `model.feature_importances_` for tree-based models). Note: This cell was skipped/cancelled during this particular run.
+
+**Where results are stored:** Feature importance rankings (when executed).
+
+---
+
+## CELL 18 -- "SHAP"
+
+**What it does:** Defines the `SHAPAnalyzer` class for SHAP (SHapley Additive exPlanations) analysis. It:
+- Creates appropriate SHAP explainers (tree, kernel, or linear depending on model type)
+- Computes SHAP values for each feature
+- Derives global feature importance rankings
+- Produces summary reports with top contributing features, their direction (positive/negative impact), and concentration metrics
+- Saves results as JSON to Azure Blob Storage
+
+**Why we use it:** SHAP provides **model-agnostic, game-theory-based** explanations of which features drove each prediction and by how much. This is critical for stakeholder trust and regulatory compliance.
+
+**Where results are stored:** Azure Blob: `shap-results/shap_2026_01.json` in the blob storage container.
+
+---
+
+## CELL 19 -- "LIME"
+
+**What it does:** Defines the `LIMEAnalyzer` class for LIME (Local Interpretable Model-agnostic Explanations). It:
+- Builds local linear approximations around each prediction
+- Explains individual instances by perturbing features
+- Aggregates explanations across instances
+- Evaluates fidelity (how well the local model approximates the actual model)
+- Produces top features and human-readable interpretations
+
+**Why we use it:** LIME provides **instance-level explanations** complementary to SHAP's global view. Together they give a complete picture of model behavior.
+
+**Where results are stored:** Azure Blob: `lime-results/lime_2026_01.json`.
+
+---
+
+## CELL 20 -- "Data Stats"
+
+**What it does:** Defines `analyze_data_patterns()` to compute basic statistics on the dataset (shape, missing values, target distribution). These stats are embedded into SHAP/LIME result JSON files as metadata.
+
+**Where results are stored:** Returned as a dictionary; included in SHAP/LIME result files.
+
+---
+
+## CELL 21 -- "Historical & Latest Feature Set"
+
+**What it does:** Defines `get_vintage_and_last_year_features()` that fetches the transformed feature row for the current vintage month and the same month from last year. Returns both raw and transformed features in JSON format.
+
+**Why we use it:** Enables year-over-year comparison in the AI summary and provides context for interpretability reports.
+
+**Where results are stored:** Returned as a dict with `vintage_features`, `last_year_features`, `vintage_raw`, `last_year_raw`.
+
+---
+
+## CELL 22 -- "Blob Storage Upload"
+
+**What it does:** Defines `save_to_blob_storage()` utility function that serializes a Python dictionary as JSON and uploads it to Azure Blob Storage using `BlobServiceClient`.
+
+**Why we use it:** Reusable utility for all blob storage writes (SHAP, LIME, AI summary results).
+
+**Where results are stored:** Function definition only.
+
+---
+
+## CELL 23 -- "Main Pipeline Calling" (Interpretability Pipeline)
+
+**What it does:** Orchestrates the full interpretability pipeline:
+1. Calls `load_model_and_data()` to get model, data, and metadata
+2. Runs `SHAPAnalyzer` to compute SHAP values
+3. Runs `LIMEAnalyzer` to compute LIME explanations
+4. Converts LIME outputs back to original scale
+5. Saves both SHAP and LIME results to Azure Blob Storage
+6. Defines helper functions for feature string conversion
+
+**Where results are stored:**
+- Azure Blob: `shap-results/shap_2026_01.json`
+- Azure Blob: `lime-results/lime_2026_01.json`
+
+---
+
+## CELL 24 -- "Install CrewAI with Azure AI Inference"
+
+**What it does:** Pip-installs CrewAI and Azure AI Inference extension (commented out -- likely already installed on the cluster).
+
+**Why we use it:** CrewAI is used in the next cell for multi-agent AI summary generation.
+
+---
+
+## CELL 25 -- "AI Summary"
+
+**What it does:** Implements an AI-powered executive summary generation system. It:
+- Loads prompt templates from YAML configuration
+- Fetches SHAP/LIME results from blob storage
+- Builds context-rich prompts with vintage features, last-year features, and interpretability data
+- Uses either **Azure OpenAI** or **CrewAI multi-agent** (Generator + Reviewer agents) to produce a business-ready executive summary
+- The summary explains what the model predicted, why (which features drove it), and how this compares to last year
+
+**Why we use it:** Translates technical ML outputs into **business language** that executives and non-technical stakeholders can understand and act upon.
+
+**Where results are stored:** AI summary text in Azure Blob Storage (e.g., `ai-summaries` container) and returned as a string.
+
+---
+
+## CELL 26 -- "Wrapper Function to Safely Execute AI Summary Generation"
+
+**What it does:** Defines `generate_summary_safe()` as a robust wrapper around the AI summary generator. It:
+- Sets required environment variables (API keys, endpoints)
+- Calls the main generation logic with error handling
+- Optionally uploads results to blob storage
+- Returns success/failure status with the summary text
+
+**Why we use it:** Production-grade error handling ensures the pipeline doesn't crash if AI summary generation fails (e.g., API timeout, rate limiting).
+
+**Where results are stored:** Summary text and blob storage upload; returns status dictionary.
+
+---
+
+## SUMMARY TABLE
+
+| Stage | Cells | Input | Output Storage |
+|-------|-------|-------|----------------|
+| **Configuration** | 1, 3 | User inputs/hardcoded | `access_key`, `full_path` variables |
+| **Logging** | 2 | Connection string | Azure Blob: `logs_model/*.log` |
+| **Data Quality** | 4 | Raw CSV (2,406 rows) | Azure Blob: `dq/*.json`, variable `dq_report` |
+| **Transformation** | 5, 6 | Raw data + historical Delta table | Variable `features_df` (1 x 60) |
+| **Persistence** | 7, 8 | `features_df` | Delta table `transform_data` |
+| **Model Config** | 9, 10, 11, 12 | Delta table config + model registry | Variables for model, config |
+| **Inference** | 13 | Historical features + model | Variable `imputed_table` |
+| **Forecast Output** | 14, 15 | `imputed_table` | Delta table `enterprise_forecast_output` |
+| **Interpretability** | 16-23 | Model + data | Azure Blob: `shap-results/*.json`, `lime-results/*.json` |
+| **AI Summary** | 24-26 | SHAP/LIME + features | Azure Blob: `ai-summaries/` |
